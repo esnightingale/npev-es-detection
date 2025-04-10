@@ -1,0 +1,1017 @@
+---
+title: "ES sites in Pakistan - 2021-24"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# Background
+
+Confidence in the interruption of poliovirus transmission is highly
+dependent on assumed sensitivity of environmental surveillance (ES), in
+particular in the case of cVDPV2 (low rate of clinical disease).
+Previous work has explored how the strength of evidence against ongoing
+circulation is influenced by variation in which sites (in which
+locations, relative to the distribution of population) are reporting
+samples at what time. This work also incorporated detection rate of
+NPEVs as another source of variation between sites, hence variation in
+the strength of evidence for absence in that location when no poliovirus
+has been detected.
+
+The latter indicator was considered only with respect to a fixed target
+rate defined by the GPEI (\>50%), which is used to monitor site
+performance and inform their opening/closure. This means that sites
+detecting NPEVs in an average of 50% of collected samples over the
+previous 12 months are considered as performing at their "maximum", with
+our measurement of sensitivity scaled down when this value falls below
+50%. In fact, the 50% threshold is arbitrarily defined and doesn't
+necessarily align with the expected prevalence of NPEVs in the
+population, in different locations and at different times of year.
+
+In this setting, the nature of collection sites varies considerably
+between natural waterways, informal drainage channels, and more formal
+sewage networks. These different types of site will likely have very
+different population catchment and virus detection sensitivity. Sites
+are, however, only defined by name and GPS location. In order to
+distinguish different site types, we can look at the land cover
+surrounding the site and the proximity/intersection with natural water
+bodies.
+
+Ultimately, we want to infer the relationship between probability of
+NPEV detection and: - Population size within Xkm - Dominant land cover
+type within Xkm - Proximity to natural waterways/bodies - Elevation
+within Xkm compared to elevation at site? [- Proportion of "flooded
+vegetation" within Xkm]
+
+For the last point, we are interested in the influence of seasonal
+flooding on NPEV detection. This may alter the usual catchment of a
+site, as well as diluting/contaminating samples with run-off from other
+regions. However, this is not a significant consideration in the context
+of Nigeria and should instead be explored in a more flood-prone setting
+such as Pakistan.
+
+The WHO establishes ES sites to supposedly capture \~100,000 people,
+however in reality this often isn't the case. Previous work has
+demonstrated significant inconsistency in the interpretation of site
+catchment. Different sites will capture different-sized areas according
+to the nature of the site, therefore it is not clear what catchment
+radius is appropriate to assumed for analysis. This could be
+investigated by
+
+Methodological approach:
+
+-   Fit GAM of P(NPEV) \~ catch_pop + lc_type + proximity_water -
+    Investigate anisotropy in the correlation structure via directional
+    variograms.
+
+-   Investigate shift in Pr NPEV detection during July/August 2022,
+    comparing sites within/without flood-affected area.
+
+## Set up environment and load data
+
+```{r}
+
+pacman::p_load(tidyverse, sf, janitor, terra, exactextractr, mgcv, gstat, broom)
+theme_set(theme_minimal())
+
+# Inputs
+indir <- "data/Pakistan"
+proj_local <- "EPSG:32631"
+
+# ES linelist
+es <- readRDS(file.path(indir,"es_analysis.rds")) |> 
+  mutate(nonpolio = is.na(final_class)|final_class %in% c("NPEV","VACCINE"))
+
+# AFP linelist
+afp <- readRDS(file.path(indir,"afp_analysis.rds"))
+
+# Population raster
+poprast  <- rast(file.path(indir,"proj_pop_rast.tif"))
+
+# Administrative boundaries
+shape2 <- readRDS(file.path(indir, "shape2.rds")) |> 
+  st_transform(proj_local)
+
+shape0 <- st_union(shape2)
+
+```
+
+# Descriptive
+
+## Unique sites and characteristics
+
+```{r}
+
+es |> 
+  select(guid, admin_0:admin_2, site_id, site_name, x, y) |> 
+  unique() -> es_sites
+
+glimpse(es_sites)
+
+```
+
+In total, `r nrow(es_sites)` unique sites active at some point between
+`r min(es$collection_date)` and `r max(es$collection_date)`.
+
+Check uniqueness of coordinates per site code:
+
+```{r}
+
+nrow(es_sites)
+n_distinct(es_sites$site_id)
+
+```
+
+```{r}
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = st_as_sf(es_sites, coords = c("x","y"), crs = 4326), 
+          pch = 22, fill = "white") + 
+  labs(title = "Unique wastewater sampling sites in Pakistan",
+       caption = "At least one sample collected Jan 2021-Dec 2024.")
+
+```
+
+### Site names
+
+Can we glean anything from site names? - Some in particular refer to
+bridges, specific streams/rivers, community hubs (e.g.
+school/mosque/camp/police station) and road intersections
+(junction/roundabout) - There is one formal wastewater treatment plant
+
+What proportion of samples from identifiable site types are
+NPEV-positive?
+
+```{r}
+
+es_sites |> 
+  mutate(keywords = gsub("[ ]", "", site_name)) |> separate_rows(keywords, sep = " ") |>
+  group_by(keywords) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+
+```
+
+```{r}
+
+es |> 
+  mutate(site_name = tolower(site_name),
+         drain = grepl("drain",site_name) | grepl("sewage",site_name) | 
+           grepl("disposal",site_name) | grepl("sewer",site_name) ,
+         water = grepl("stream",site_name) | grepl("river",site_name) | 
+           grepl("pond",site_name) | grepl("canal",site_name),
+         comm_site = grepl("school",site_name) | grepl("college",site_name) | 
+           grepl("market",site_name) | grepl("masjid",site_name),
+         hosp = grepl("hospital", site_name),
+         junction = grepl("junction",site_name),
+         wwtp = (grepl("pumping",site_name)|
+                   (grepl("pump", site_name) & grepl("station", site_name))|
+                   grepl("plant", site_name)),
+         no_type = !(drain|water|comm_site|hosp|junction|wwtp)) -> tmp
+
+tmp |> summarise(across(drain:no_type, sum)) 
+
+tmp |> 
+  pivot_longer(drain:no_type, names_to = "type") |> 
+  filter(value, type != "no_type") |> 
+  ggplot(aes(type, fill = !is.na(npev))) + 
+  geom_bar() + 
+  labs(fill = "NPEV+", x = NULL, y = "Count", title = "Sample count and positivity by rough site type")
+
+```
+
+Not really helpful...
+
+Just distinguish WWTPs:
+
+```{r}
+
+es_sites |> 
+  full_join(select(tmp, site_id, wwtp) |> distinct()) |> 
+  mutate(wwtp_f = factor(wwtp, levels = c(FALSE,TRUE), labels = c("Other","PS or TP"))) |> 
+  arrange(wwtp_f) -> es_sites
+
+tabyl(es_sites$wwtp)
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data =  st_as_sf(es_sites, coords = c("x","y"), crs = 4326), 
+          aes(fill = wwtp_f),
+          pch = 22) + 
+  scale_fill_manual("Site type",values = c("white","blue1")) +
+  labs(title = "Unique wastewater sampling sites in Pakistan",
+       subtitle = "Pumping stations and sewage treatment plants",
+       caption = "At least one sample collected Jan 2021-Dec 2024.")
+
+```
+
+Estimate crude detection rates by site type:
+
+```{r}
+
+tmp |> 
+  group_by(wwtp) |>
+  summarise(n = n(),
+            npev_pos = sum(!is.na(npev)),
+            lo = Hmisc::binconf(npev_pos, n)[2],
+            hi = Hmisc::binconf(npev_pos, n)[3]) |>
+  ungroup() |> 
+  mutate(wwtp_f = factor(wwtp, levels = c(FALSE,TRUE), labels = c("Other","PS or TP"))) |> 
+  ggplot(aes(wwtp_f, npev_pos/n, ymin = lo, ymax = hi)) + 
+  geom_errorbar(width = 0.2) +
+  geom_point() +
+  theme(legend.position = c(0.1,0.1)) + 
+  labs(fill = "NPEV+", 
+       x = NULL, y = "Proportion positive", 
+       title = "Sample positivity by site type",
+       subtitle = "95% binomial confidence intervals")
+
+tmp |> 
+  filter(nonpolio) |> 
+  group_by(wwtp) |>
+  summarise(n = n(),
+            npev_pos = sum(!is.na(npev)),
+            lo = Hmisc::binconf(npev_pos, n)[2],
+            hi = Hmisc::binconf(npev_pos, n)[3]) |>
+  ungroup() |> 
+  mutate(grp = "Excluding PV+") -> tmp2
+
+tmp |> 
+  group_by(wwtp) |>
+  summarise(n = n(),
+            npev_pos = sum(!is.na(npev)),
+            lo = Hmisc::binconf(npev_pos, n)[2],
+            hi = Hmisc::binconf(npev_pos, n)[3]) |>
+  ungroup() |> 
+  mutate(grp = "Including PV+") |> 
+  bind_rows(tmp2) |> 
+  mutate(wwtp_f = factor(wwtp, levels = c(FALSE,TRUE), labels = c("Other","PS or TP"))) |> 
+  ggplot(aes(wwtp_f, npev_pos/n, ymin = lo, ymax = hi, lty = grp)) + 
+  geom_errorbar(width = 0.2) +
+  geom_point() +
+  scale_linetype_manual(values = c("dashed",'solid')) +
+  theme(legend.position = c(0.1,0.1)) + 
+  labs(fill = "NPEV+", 
+       lty = NULL,
+       x = NULL, y = "Proportion positive", 
+       title = "Sample positivity by site type",
+       subtitle = "95% binomial confidence intervals")
+
+```
+
+### Catchment population
+
+```{r}
+
+es_sites_utm <- st_as_sf(es_sites, coords = c("x","y"), crs = 4326) |> 
+  st_transform(proj_local)
+
+es_buff <- st_buffer(es_sites_utm, dist = units::set_units(2, "km"))
+
+# Population within 2km of each site:
+es_sites_utm$catchment_2k <- exactextractr::exact_extract(poprast, es_buff, "sum") 
+
+# Total population per admin2 area:
+shape2$total_pop <- exactextractr::exact_extract(poprast, shape2, "sum")
+    
+hist(es_sites_utm$catchment_2k)
+summary(es_sites_utm$catchment_2k)
+
+```
+
+On average, `r mean(es_sites_utm$catchment_2k, na.rm = T)` people reside
+within 2km of an individual collection site, with a total of
+`r sum(es_sites_utm$catchment_2k)` within 2km of *any* site
+(\~`r round(sum(es_sites_utm$catchment_2k)/sum(shape2$total_pop)*100)`%
+of the national population).
+
+```{r}
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = es_sites_utm |> st_transform(4326), aes(size = catchment_2k, colour = catchment_2k), pch = 15, alpha = 0.7) + 
+  scale_colour_viridis_c(trans = "sqrt", labels = scales::label_comma()) +
+  theme(legend.position = c(0.9,0.25)) + 
+  guides(size = "none") + 
+  labs(colour = NULL,
+       title = "Catchment population within 2km of site")
+
+```
+
+### Sample frequency
+
+How many samples are collected per site?
+
+```{r}
+
+es |> 
+  mutate(collection_month = month,
+         month = lubridate::month(month, label = T)) |> 
+  group_by(collection_month, month, year, site_id, x, y) |> 
+  summarise(
+    n_samples = n(),
+    n_cvdpv2 = sum(final_class == "cVDPV2", na.rm = T),
+    n_npev = sum(!is.na(npev))) |> 
+  ungroup() -> es_mth
+  
+tabyl(es_mth, n_samples)
+
+tabyl(es_mth, month, n_samples)
+
+ggplot(st_drop_geometry(es_mth)) + 
+  geom_bar(aes(month, fill = as.factor(n_samples))) + 
+  labs(y = "Number of sites", x = "Month", fill = "Sampling\nfrequency")
+
+```
+
+Fewer sites sampling twice-monthly during summer?
+
+The majority of sites are reporting one sample per month, with the rest
+reporting two. On very few occasions has a site reported more than two
+samples in a given month. Which sites are these? Do some consistently
+report more than others?
+
+```{r}
+
+es_mth |> 
+  filter(n_samples > 2) |> 
+  st_as_sf(coords = c("x","y"), crs = 4326) |> 
+  st_jitter() |> 
+  ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(pch = "+", cex = 5, alpha = 0.5) + 
+  theme_void()
+
+```
+
+### Sample quality
+
+Reported sample quality likely links to the sensitivity for NPEV
+detection, however few samples are reported as something other than
+"good":
+
+```{r}
+
+tabyl(es$sample_condition)
+ggplot(es, aes(year, fill = sample_condition)) + 
+  geom_bar()
+
+es |> 
+  group_by(site_id, x, y) |> 
+  summarise(p_qual = mean(!is.na(sample_condition) & sample_condition == "Good")) |> 
+  ungroup() |> 
+  st_as_sf(coords = c("x","y"), crs = 4326) -> tmp
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = tmp, aes(fill = p_qual), pch = 22) + 
+  scale_fill_viridis_c(limits = c(0,1)) +
+  theme(legend.position = c(0.9,0.25)) + 
+  labs(fill = NULL,
+       title = "Overall proportion of good-condition samples",
+       caption = "At least one sample collected Jan 2021-Dec 2024.")
+
+```
+
+### Land cover within catchment area
+
+If we can't really distinguish site types from their name, perhaps we
+can infer something from the type environment surrounding the site
+location, e.g. - Urbanicity - Land cover - Proximity to water
+
+Load rasters of land use and distance to waterways: [Note that these
+from WorldPop are quite out of date - should be replaced with ESRI land
+cover estimates]
+
+```{r}
+
+# water_dist  <- rast("data/nga_osm_dst_waterway_100m_2016.tif") |> 
+#   terra::project(proj_local)
+# 
+# built_extent  <- rast("data/nga_bsgme_v0a_100m_2020.tif") |> 
+#   terra::project(proj_local)
+
+```
+
+```{r}
+# 
+# plot(water_dist)
+# plot(built_extent)
+
+```
+
+-   Built extent raster is binary, but seems to be aggregated to a
+    different resolution in autoplot hence non-binary values.
+-   Water distance raster is in km to the nearest *major* waterway.
+
+First look at the point value at each site (create a small buffer to
+still use exact_extract):
+
+```{r}
+
+# es_buff_sm <- st_buffer(es_sites_utm, dist = units::set_units(50, "m"))
+# 
+# es_sites_utm$built_extent <- exactextractr::exact_extract(built_extent, es_buff_sm, "mean")
+# es_sites_utm$water_dist <- exactextractr::exact_extract(water_dist, es_buff_sm, "mean") 
+# 
+# summary(es_sites_utm$built_extent)
+# hist(es_sites_utm$built_extent)
+# 
+# summary(es_sites_utm$water_dist)
+# hist(es_sites_utm$water_dist)
+
+```
+
+Also look at average value within 2km catchment:
+
+```{r}
+
+# es_sites_utm$built_2k <- exactextractr::exact_extract(built_extent, 
+#                                                       es_buff,
+#                                                       "mean") 
+# es_sites_utm$water_2k <- exactextractr::exact_extract(water_dist, 
+#                                                       es_buff,
+#                                                       "mean") 
+# 
+# ggplot(es_sites_utm, aes(built_extent, built_2k)) + geom_abline() + geom_point(alpha = 0.5) 
+# ggplot(es_sites_utm, aes(water_dist, water_2k)) + geom_abline() + geom_point(alpha = 0.5)
+
+```
+
+Makes sense that water distance is essentially equal - we've just added
+2km radius and many values are tens of km away.
+
+## NPEV detection by site and month
+
+### Overall
+
+```{r}
+
+es |> 
+  ggplot(aes(year, fill = !is.na(npev))) + 
+  geom_bar() + 
+  labs(x = NULL, y = "No. Samples", fill = "NPEV+")
+
+es |> 
+  group_by(year) |>
+  summarise(n = n(),
+            npev_pos = sum(!is.na(npev)),
+            lo = Hmisc::binconf(npev_pos, n)[2],
+            hi = Hmisc::binconf(npev_pos, n)[3]) |>
+  ungroup() |> 
+  ggplot(aes(year, npev_pos/n, ymin = lo, ymax = hi)) + 
+  geom_errorbar(width = 0.2) +
+  geom_point() +
+  ylim(c(0,1)) +
+  labs(fill = "NPEV+", 
+       x = NULL, y = "Proportion positive", 
+       title = "Sample NPEV positivity by year",
+       subtitle = "95% binomial confidence intervals")
+
+es |> 
+  group_by(month) |>
+  summarise(n = n(),
+            npev_pos = sum(!is.na(npev)),
+            lo = Hmisc::binconf(npev_pos, n)[2],
+            hi = Hmisc::binconf(npev_pos, n)[3]) |>
+  ungroup() |> 
+  ggplot(aes(month, npev_pos/n, ymin = lo, ymax = hi, col = (npev_pos/n > 0.5))) + 
+  geom_errorbar(width = 0.2) +
+  geom_point() +
+  geom_vline(xintercept = ymd(paste0(2021:2025,"-01-01")), 
+             lty = "dashed", col = "grey") +
+  ylim(c(0,1)) +
+  labs(fill = "NPEV+", 
+       x = NULL, y = "Proportion positive",
+       col = "NPEV+ > 50%",
+       title = "Sample NPEV positivity by month",
+       subtitle = "95% binomial confidence intervals")
+
+
+es |> 
+  mutate(site_no = as.numeric(as.factor(site_id))) |> 
+  group_by(admin_1, site_id, site_no) |>
+  summarise(n = n(),
+            npev_pos = sum(!is.na(npev)),
+            lo = Hmisc::binconf(npev_pos, n)[2],
+            hi = Hmisc::binconf(npev_pos, n)[3]) |> 
+  group_by(admin_1) |>
+  mutate(adm1_br = ifelse(row_number() == 1, site_no - 0.5, NA)) |> 
+  ungroup() |>
+  ggplot(aes(site_no, npev_pos/n, ymin = lo, ymax = hi, col = (npev_pos/n > 0.5))) + 
+  geom_errorbar(width = 0.2) +
+  geom_point() +
+  geom_vline(aes(xintercept = adm1_br)) +
+  ylim(c(0,1)) +
+  labs(fill = "NPEV+", 
+       x = NULL, y = "Proportion positive",
+       col = "NPEV+ > 50%",
+       title = "Sample NPEV positivity by site",
+       subtitle = "95% binomial confidence intervals")
+
+```
+
+```{r}
+
+es |> 
+  group_by(site_id, x, y) |> 
+  summarise(p_npev = sum(!is.na(npev))/n(),
+            pop = mean(catchment_pop_5k)) |> 
+  ungroup() |> 
+  st_as_sf(coords = c("x","y"), crs = 4326) -> tmp
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = tmp, aes(col = p_npev*100, size = pop), pch = 15, alpha = 0.6) + 
+  scale_colour_viridis_c(limits = c(0,100)) +
+  # theme(legend.position = c(0.9,0.25)) + 
+  labs(fill = NULL,
+       colour = "% NPEV+",
+       size = "Estimated\ncatchment",
+       title = "Percentage of NPEV+ samples per site",
+       caption = "At least one sample collected Jan 2021-Dec 2024.") +
+  theme_void()
+
+```
+
+### By time
+
+```{r}
+
+es |> 
+  ggplot(aes(month, fill = !is.na(npev))) + 
+  geom_bar() + 
+  labs(x = "Collection month", y = "No. samples", fill = "NPEV+")
+
+es |> 
+  mutate(collection_month = month,
+         month = lubridate::month(collection_month, label = T)) |> 
+  group_by(site_id, x, y, year, month, collection_month) |> 
+  summarise(n_samples = n(),
+            p_npev = sum(!is.na(npev))/n_samples) |> 
+  ungroup() |> 
+  st_as_sf(coords = c("x","y"), crs = 4326) -> tmp
+
+tmp |> 
+  mutate(year = as.factor(year)) |> 
+  ggplot(aes(month, p_npev, group = year)) + 
+  geom_line(alpha = 0.5, col = "grey") + 
+  geom_smooth(aes(col = year), method = "loess") +
+  labs(x = NULL, y = "Prop. NPEV+", col = "Year")
+
+```
+
+### By site and time
+
+```{r}
+
+es |> 
+  group_by(site_id, x, y, year) |> 
+  summarise(n_samples = n(),
+            p_npev = sum(!is.na(npev))/n_samples) |> 
+  ungroup() |> 
+  st_as_sf(coords = c("x","y"), crs = 4326) -> tmp
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326), fill = "white") + 
+  geom_sf(data = st_jitter(tmp, factor = 0.0005), 
+          aes(col = p_npev, alpha = n_samples)) + 
+  facet_wrap(~year) + 
+  scale_color_viridis_c(trans = "sqrt", direction = 1) +  
+  labs(caption = "Points jittered for visibility.",
+       title = "NPEV positivity per site, per year",
+       alpha = "No. samples",
+       colour = "Proportion") + 
+  theme_bw() + 
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+
+ggplot() +
+  geom_sf(data = shape0 |> st_transform(4326)) +
+  geom_sf(data = st_jitter(tmp, factor = 0.0005), aes(fill = (p_npev >= 0.5)), pch = 22) +
+  facet_wrap(~year) +
+  theme_minimal() +
+  labs(caption = "Points jittered for visibility.",
+       fill = NULL,
+       title = "At least 50% NPEV positivity") + 
+  theme_bw() + 
+  theme(axis.text = element_blank(), axis.ticks = element_blank())
+
+```
+
+# Modelling
+
+## Make analysis dataset
+
+To begin with, look at just total per year given site characteristics
+and location.
+
+Aggregate samples to site/month/year totals and define spatial geometry:
+
+```{r}
+
+es |> 
+  mutate(collection_month = month,
+         month = lubridate::month(month, label = T)) |> 
+  group_by(collection_month, month, year, site_id, x, y) |> 
+  summarise(
+    n_samples = n(),
+    n_cvdpv2 = sum(final_class == "cVDPV2", na.rm = T),
+    n_npev = sum(!is.na(npev))) |> 
+  ungroup()|> 
+  mutate(p_npev = n_npev/n_samples,
+         p_cvdpv2 = n_cvdpv2/n_samples) |> 
+  left_join(es_sites_utm |> st_drop_geometry() |> select(site_id, catchment_2k)) -> es_agg_mth
+
+es_pt_mth <- es_agg_mth |> 
+  st_as_sf(coords = c("x","y"), crs = 4326) 
+
+es_pt_mth |> 
+  group_by(year, site_id, catchment_2k) |> 
+  summarise(across(n_samples:n_npev, sum)) |> 
+  ungroup()|> 
+  mutate(p_npev = n_npev/n_samples,
+         p_cvdpv2 = n_cvdpv2/n_samples) -> es_pt_yr
+
+```
+
+```{r}
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = st_jitter(es_pt_yr, factor = 0.0005), pch = 22, fill = "white") + 
+  facet_wrap(~year) +  
+  theme_minimal() + 
+  labs(caption = "Points jittered for visibility.",
+       title = "Unique sites reporting samples between Jan 2021 and Oct 2024") 
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = st_jitter(es_pt_yr, factor = 0.0005), aes(col = p_npev), cex = 0.8) + 
+  facet_wrap(~year) + 
+  scale_color_viridis_c(trans = "sqrt") + 
+  theme_minimal() + 
+  labs(caption = "Points jittered for visibility.",
+       title = "NPEV positivity per site, per year",
+       colour = "Proportion") 
+
+ggplot() +
+  geom_sf(data = shape0 |> st_transform(4326)) +
+  geom_sf(data = st_jitter(es_pt_yr, factor = 0.0005), aes(fill = (p_npev >= 0.5)), pch = 22) +
+  facet_wrap(~year) +
+  theme_minimal() +
+  labs(caption = "Points jittered for visibility.",
+       fill = NULL,
+       title = "At least 50% NPEV positivity")
+
+```
+
+Initially few sites with \>50% NPEV positivity rate per year, but
+increasing over time.
+
+Visualise these predictors against empirical logit of p[NPEV]:
+
+```{r}
+
+es_pt_yr |> 
+  mutate(elogitp = log((n_npev+0.5)/(n_samples-n_npev+0.5))) |> 
+  bind_cols(st_coordinates(es_pt_yr)) |> 
+  st_drop_geometry() |> 
+  select(catchment_2k, year,
+         X, Y,
+         elogitp) %>% 
+  pivot_longer(-elogitp) %>% 
+  ggplot(aes(value, elogitp)) + 
+  geom_jitter(alpha = 0.5) + 
+  geom_smooth() + 
+  facet_wrap(~name, scales = "free_x") + 
+  theme_bw()
+
+```
+
+Also for monthly positivity:
+
+```{r}
+
+es_pt_mth |> 
+  mutate(elogitp = log((n_npev+0.5)/(n_samples-n_npev+0.5)),
+         month = as.numeric(month)) |> 
+  bind_cols(st_coordinates(es_pt_mth)) |>
+  st_drop_geometry() |> 
+  select(month, year, 
+         catchment_2k,
+         X, Y,
+         elogitp) |>
+  pivot_longer(-elogitp) |>
+  ggplot(aes(value, elogitp)) + 
+  geom_jitter(alpha = 0.2) + 
+  geom_smooth() + 
+  facet_wrap(~name, scales = "free_x") + 
+  theme_bw()
+
+```
+
+Distinct bump in NPEV-positivity during early summer.
+
+## Monthly
+
+```{r}
+
+plot_es_npev_pos <- function(yr){
+ ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = st_jitter(filter(es_pt_mth, year == yr), factor = 0.0005), 
+          aes(col = p_npev, size = n_samples), alpha = 0.5) + 
+  facet_wrap(~month) + 
+  scale_color_viridis_c(trans = "sqrt") + 
+  theme_minimal() + 
+  theme(axis.text = element_blank()) +  
+  labs(caption = "Points jittered for visibility.",
+       title = paste0("NPEV positivity per site, per month (",yr,")"),
+       colour = "Proportion\npositive",
+       alpha = "No.\nsamples") -> p
+  
+  return(p)
+}
+
+lapply(c(2021:2024), plot_es_npev_pos)
+
+```
+
+Look at seasonal trend by year:
+
+```{r}
+
+es_pt_mth |> 
+  mutate(year = as.factor(year)) |> 
+  ggplot(aes(month, p_npev, group = year)) + 
+  geom_line(alpha = 0.5, col = "grey") + 
+  geom_smooth(aes(col = year), method = "loess")
+
+```
+
+Between 2021-23 there was an overall increase in NPEV positivity, with a
+similar late-summer peak each year. The increase towards the peak is
+more gradual than the decrease after. In 2021 and 2023 we see a small
+bump coming up to July but this is not observed in 2022, which appears
+more wobbly.
+
+The 2024 trend is quite different to the other years, generally
+decreasing with a small bump in June.
+
+```{r}
+
+plot_es_npev_pos <- function(yr){
+ ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = st_jitter(filter(es_sf, year == yr), factor = 0.0005), 
+          aes(col = p_npev, size = n_samples), alpha = 0.5) + 
+  facet_wrap(~month) + 
+  scale_color_viridis_c(trans = "sqrt") + 
+  theme_minimal() + 
+  theme(axis.text = element_blank()) +  
+  labs(caption = "Points jittered for visibility.",
+       title = paste0("NPEV positivity per site, per month (",yr,")"),
+       colour = "Proportion\npositive",
+       alpha = "No.\nsamples") -> p
+  
+  return(p)
+}
+
+lapply(c(2021:2024), plot_es_npev_pos)
+
+```
+
+Try fitting a model by month:
+
+```{r}
+
+modeldata_m <- bind_cols(es_pt_mth, st_coordinates(es_pt_mth)) |> 
+  mutate(m = as.numeric(month),
+         year_f = as.factor(year)) |> 
+  group_by(site_id) |> 
+  mutate(sid = cur_group_id() |>  as.factor()) |> 
+  ungroup()
+
+m4 <- gam(data = modeldata_m,
+          weights = n_samples,
+          p_npev ~ s(catchment_2k, k = 3) + # s(built_2k, k = 3) + s(water_dist, k = 3) + 
+            s(m, by = year_f, k = 5) + year_f + 
+            s(X, Y, bs = "gp"),
+          family = binomial())
+
+summary(m4)
+plot(m4, pages = 1)
+
+```
+
+Want to look at effect of recent rainfall on npev detection, and in
+particular when in time this effect was significant e.g.
+here[<https://r.qcbs.ca/workshop08/book-en/changing-the-basis-function.html>]
+and
+here[<https://aslopubs.onlinelibrary.wiley.com/doi/10.4319/lo.2009.54.6_part_2.2529>].
+
+<br>
+
+# Incorporate NPEV in AFP notifications
+
+```{r}
+
+afp |> 
+  group_by(guid,x,y) |> 
+  count(name = "n_unique") |> 
+  ungroup() |> 
+  group_by(n_unique) |> 
+  count()
+
+afp |> 
+  select(guid, x, y) |> 
+  unique() -> afp_locs
+
+table(afp$npev)
+```
+
+```{r}
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = st_as_sf(afp_locs, coords = c("x","y"), crs = 4326), pch = 22, fill = "white") + 
+  labs(title = "Given locations of notified AFP cases",
+       caption = "Jan 2021-Dec 2024.")
+
+ggplot() + 
+  geom_sf(data = shape0 |> st_transform(4326)) + 
+  geom_sf(data = st_as_sf(afp |> filter(!is.na(npev)), coords = c("x","y"), crs = 4326), 
+          aes(fill = onset_date), pch = 22, alpha = 0.4) + 
+  scale_fill_viridis_c() + 
+  theme(legend.position = c(0.9,0.25)) + 
+  labs(fill = NULL,
+       title = "NPEV-positive notified AFP cases",
+       caption = "Jan 2021-Dec 2024.")
+```
+
+Why do black borders of points seem to recreate district boundaries?
+
+# Modelling
+
+First fit a model for NPEV positivity given these covariates:
+
+```{r}
+
+# Exclude obs with missing built extent
+modeldata <- bind_cols(es_pt_yr, st_coordinates(es_pt_yr)) |> 
+  group_by(site_id) |> 
+  mutate(sid = cur_group_id() |>  as.factor()) |> 
+  ungroup()
+
+m1 <- gam(data = modeldata, 
+          weights = n_samples,
+          p_npev ~ s(catchment_2k, k = 3) + year,
+          family = binomial())
+
+summary(m1)
+plot(m1, pages = 1)
+
+```
+
+Then look at residual spatial correlation:
+
+```{r}
+
+resid_dev <- resid(m1, "deviance")
+plot(resid_dev, main = "Deviance Residuals", ylab = "Residuals", xlab = "Index")
+
+modeldata |> 
+  select(site_id, geometry) |> 
+  mutate(resid_m1 = resid_dev) |> 
+  as_Spatial() -> m1_resids_sp
+
+# Compute the empirical variogram
+vgm_residuals <- variogram(resid_m1 ~ 1, data = m1_resids_sp)
+plot(vgm_residuals, main = "Empirical Variogram of Residuals", xlab = "Distance", ylab = "Semivariance")
+
+```
+
+Some evidence of residual spatial correlation. Also an undulating
+pattern with increasing distance? Could this be down to non-spatial
+heterogeneity between sites?
+
+```{r}
+
+m2 <- gam(data = modeldata,
+          weights = n_samples,
+          p_npev ~ s(catchment_2k, k = 3) + year + s(sid, bs = "re"),
+          family = binomial())
+
+summary(m2)
+plot(m2, pages = 1)
+
+AIC(m1, m2)
+
+# Look at spatial correlation in site random effects
+m2_re <- gratia::smooth_estimates(m2) |> filter(.smooth == "s(sid)")
+plot(m2_re$sid, m2_re$.estimate, main = "Fitted site-level random effect", ylab = "Estimate", xlab = "Site")
+
+modeldata |> 
+  select(sid, site_id, geometry) |> 
+  full_join(select(m2_re, sid, .estimate, .se)) |> 
+  as_Spatial() -> m2_re_sp
+
+# Compute the empirical variogram
+vgm_re <- variogram(.estimate ~ 1, data = m2_re_sp)
+plot(vgm_re, main = "Empirical Variogram of site-level random effects", xlab = "Distance", ylab = "Semivariance")
+
+vgm_re_se <- variogram(.se ~ 1, data = m2_re_sp)
+plot(vgm_re_se, main = "Empirical Variogram of site-level random effects (Std Err)", xlab = "Distance", ylab = "Semivariance")
+
+```
+
+Apparently stronger spatial trend in site-level random effects - also
+catchment and built area have lost significance (not surprising).
+
+```{r}
+
+m3 <- gam(data = modeldata,
+          weights = n_samples,
+          p_npev ~ s(catchment_2k, k = 3) + year + s(X, Y, bs = "gp") + s(sid, bs = "re"),
+          family = binomial())
+
+summary(m3)
+plot(m3, pages = 1)
+
+AIC(m1, m2, m3)
+
+# Plot the 2D smooth term effect (it won't be a full 2D plot but marginal effects)
+plot(m3, select = 4)
+
+m3_re <- gratia::smooth_estimates(m3) |> filter(.smooth == "s(sid)")
+plot(m3_re$sid, m3_re$.estimate, main = "Fitted site-level random effect", ylab = "Estimate", xlab = "Site")
+
+modeldata |> 
+  select(sid, site_id, geometry) |> 
+  full_join(select(m3_re, sid, .estimate, .se)) |> 
+  as_Spatial() -> m3_re_sp
+
+vgm_re_3 <- variogram(.estimate ~ 1, data = m3_re_sp)
+plot(vgm_re_3, main = "Empirical Variogram of site-level random effects", xlab = "Distance", ylab = "Semivariance")
+```
+
+Spatial smooth doesn't fit to anything now that site-level REs included.
+
+```{r}
+
+augment(m1, 
+        type.predict = "link",
+        type.residuals = "pearson") %>%
+  {bind_cols(modeldata[,'geometry'],.)} %>%
+  ggplot(data= .) +
+  geom_sf(aes(col = .resid), pch = 19, alpha = 0.7) +
+  scale_colour_gradient2(name = "Residuals", limits = c(-4,4)) +
+  theme_bw() 
+augment(m2, 
+        type.predict = "link",
+        type.residuals = "pearson") %>%
+  {bind_cols(modeldata[,'geometry'],.)} %>%
+  ggplot(data= .) +
+  geom_sf(aes(col = .resid), pch = 19, alpha = 0.7) +
+  scale_colour_gradient2(name = "Residuals", limits = c(-4,4)) +
+  theme_bw() 
+
+```
+
+### Plot prediction over space
+
+Just look at variation captured in the GP first - i.e. set other
+covariates to average:
+
+```{r}
+
+# Create a grid of points for prediction
+bbox <- st_bbox(shape0 |> st_transform(4326))
+x_range <- seq(bbox[1], bbox[3], length.out = 100)
+y_range <- seq(bbox[2], bbox[4], length.out = 100)
+grid <- expand.grid(X = x_range, Y = y_range)
+
+# Set other covariates (z and w) to their mean values
+mean_catch <- mean(modeldata$catchment_2k)
+mean_built <- mean(modeldata$built_2k)
+mean_water <- mean(modeldata$water_dist)
+
+# Add the constant covariates to the grid and year
+grid$catchment_2k <- mean_catch
+grid$built_2k <- mean_built
+grid$water_dist <- mean_water
+grid$year <- 2024
+
+grid$z_pred <- predict(m2, newdata = grid)
+
+# Plot the smooth term effect using a viridis color scale
+ggplot() +
+  geom_tile(data = grid, aes(x = X, y = Y, fill = z_pred)) +
+  geom_sf(data = st_union(shape2) |> st_transform(4326), color = "black", alpha = 0) +
+  scale_fill_viridis_c() + 
+  labs(title = "2D Smooth Term Effect from GAM", x = "X Coordinate", y = "Y Coordinate") +
+  theme_minimal()
+
+```

@@ -1,0 +1,342 @@
+---
+title: 'Part 1: District NPEV prevalence model'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, spdep, brms, units, loo)
+theme_set(theme_minimal())
+
+dir <- "data/Pakistan"
+
+source("./utils/fit_npafp_model.R")
+source("./utils/check_model_fit.R")
+
+# NP-AFP analysis data
+data <- readRDS(here(dir, "afp_analysis.rds"))
+
+# Shapefiles and adjacency matrix
+shape2 <- readRDS(here(dir,"shape2.rds")) 
+W <- readRDS(here(dir,"W.rds"))
+
+rerun = FALSE
+
+```
+
+# Descriptive
+
+```{r}
+
+data |> 
+  tbl_summary(include = c(n_afp, n_npafp, n_npev, npafp_r, npev_npafp_p),
+              by = year,
+              label = list(n_afp = "Total AFP notifications", 
+                           n_npafp = "Non-polio AFP notifications", 
+                           n_npev = "NPEV positives", 
+                           npafp_r = "Non-polio AFP rate (per 100,000 U15s)", 
+                           npev_npafp_p = "Crude NPEV prevalence")) |> 
+  add_overall() |> 
+  as_gt()
+
+```
+
+Plot crude NPEV prevalence among notified non-polio AFP cases, per district and over time:
+
+```{r}
+
+# Annual NPEV+ rate by district
+data |> 
+  group_by(guid, year) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  right_join(shape2) |> 
+  ggplot(aes(fill = r_npev, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~year) +
+  scale_fill_viridis_c(name = "NPEV+\nPrevalence", trans = "sqrt") + 
+  theme_void() -> p_obs_dist_yr
+
+# Seasonal trend, by year
+data |> 
+  group_by(month_of_year, year) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = factor(year), col = factor(year), fill = factor(year))) + 
+  geom_point() + 
+  geom_smooth() + 
+  # guides(fill = "none") +
+  labs(x = NULL, y = "NPEV+ Prevalence", col = "Year", fill = "Year") -> p_obs_mth_yr
+
+# Seasonal trend, by province
+data |> 
+  group_by(month_of_year, place_admin_1) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = place_admin_1, col = place_admin_1, fill = place_admin_1)) + 
+  # geom_jitter(alpha = 0.2) + 
+  geom_smooth() + 
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_prov
+
+# Seasonal trend, by district
+data |> 
+  group_by(month_of_year, guid) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = guid)) + 
+  # geom_jitter(alpha = 0.2) + 
+  geom_smooth(alpha = 0.1, lwd = 0.2, se = F) + 
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_dist
+
+p_obs_mth_yr
+p_obs_dist_yr
+p_obs_mth_prov
+p_obs_mth_dist
+
+```
+
+Overall decrease year on year, with more pronounced seasonality in 2021. 
+
+# Model fit
+
+Based on Kroiss et al. analysis, NPEV prevalence around 25% per month. 
+ -> N(-1,1) informative prior on overall intercept
+
+```{r}
+
+fitdata <- mutate(data, 
+                  month_of_year = as.numeric(month_of_year),
+                  year = factor(year))
+
+# Option not to rerun with each render
+if (file.exists("output/fit_prev.rds") & rerun == FALSE) { 
+  fit_prev <- readRDS("output/fit_prev.rds")
+} else {
+  # Define formula
+  formula <- bf(
+      n_npev | trials(n_npafp) ~ 
+        # Fixed effect on population density
+        log(guid_pop_dens) + 
+        # Random intercept by province?
+        # (1 | place_admin_1) + 
+        # Random walk by month
+        (1 | gr(t, by = "rw1")) + 
+        # BYM2 random effect across districts
+        car(W, gr = guid, type = "bym2") +   
+        # Periodic spline on 1-12 for seasonality, by district
+        s(month_of_year, bs = "cc", k = 12, by = guid) 
+    )
+  # Fit and save model
+  fit_prev <- fit_npafp_model(fitdata, W, formula)
+  saveRDS(fit_prev, "output/fit_prev.rds")
+
+}
+
+```
+
+## Model checks
+
+```{r}
+
+summary(fit_prev)
+check_model_fit(fit_prev)
+
+loo(fit_prev)
+
+```
+
+Inspect residual correlation by month and district:
+
+```{r}
+
+check_residuals(fit_prev, data, shape2)
+
+```
+# Plot model fit
+
+```{r}
+
+  plot(fit_prev)
+
+  # Fixed effects
+  plot(conditional_effects(fit_prev, "guid_pop_dens"), 
+       # points = T, point_args = list(width = 50, alpha = 0.2),
+       rug = T)
+
+  # Smooths
+  plot(conditional_smooths(fit_prev))
+       
+```
+
+## Extract posterior draws and plot random walk
+
+```{r}
+
+posterior_samples <- as_draws_df(fit_prev)  
+
+# Extract RW component 
+rw_t <- posterior_samples |>  select(starts_with("r_t"))  
+
+# Summarise across draws
+rw_summary <- rw_t |> 
+  pivot_longer(cols = everything(), names_to = "time", values_to = "rw_value") |>
+  mutate(time = as.numeric(gsub("r_t\\[", "", gsub(",Intercept\\]", "", time)))) |>
+  group_by(time) |> 
+  summarise(
+    mean_rw = mean(rw_value),
+    lower = quantile(rw_value, 0.025),
+    upper = quantile(rw_value, 0.975)
+  ) 
+  # # Transform to probability scale
+  # mutate(across(mean_rw:upper, \(x) exp(x)/(1+exp(x))))
+
+ggplot(rw_summary, aes(x = time, y = mean_rw)) +
+  geom_line(color = "steelblue") +
+  geom_ribbon(aes(ymin = lower, ymax = upper), 
+              alpha = 0.2, fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Estimated first-order random walk",
+    x = "Time",
+    y = "Estimate"
+  )
+
+```
+
+-> Downward shift at the end of 2022? 
+
+# Predict prevalence by district-month
+
+Set at least one NP-AFP case per district-month to force prediction > 0.
+
+```{r}
+
+newdata <- fitdata
+newdata$n_npafp[newdata$n_npafp == 0] <- 1
+
+# Extract predictions
+pred_prev <- posterior_epred(fit_prev, 
+                             newdata = newdata, 
+                             scale = "linear")
+
+# Summarise 
+pred_summary <- as.data.frame(t(apply(pred_prev, 
+                                      2, 
+                                      quantile, 
+                                      probs = c(0.025, 0.5, 0.975))))
+colnames(pred_summary) <- c("lower", "median", "upper")
+
+# Add to data and scale to prevalence
+data_wpred <- newdata |> 
+  mutate(pred_lo = pred_summary$lower,
+         pred_med = pred_summary$median,
+         pred_hi = pred_summary$upper, 
+         pred_mean = apply(pred_prev, 2, mean),
+         pred_sd = apply(pred_prev, 2, sd),
+         across(starts_with("pred"), \(x) x/n_npafp)) 
+
+```
+
+## Check 
+
+```{r}
+
+data_wpred |> 
+  select(pred_lo:pred_sd) |> 
+  summary()
+
+summary(data_wpred$pred_med - data_wpred$pred_mean)
+
+```
+
+## Plotting
+
+### By month and district
+
+```{r}
+
+data_wpred |> 
+  ggplot(aes(month, group = guid)) + 
+  geom_jitter(aes(y = npev_npafp_p), 
+             col = "grey", alpha = 0.5, cex = 0.2) +
+  geom_ribbon(aes(ymin = pred_lo, ymax = pred_hi), 
+              alpha = 0.2, fill = "lightsteelblue") + 
+  geom_line(aes(y = pred_med), alpha = 0.2, col = "steelblue4") + 
+  # geom_line(aes(y = pred_mean), col = "red", alpha = 0.1) +
+  labs(y = "Estimated prevalence", x = "Month", title= "Predicted median & quantiles")
+
+data_wpred |> 
+  ggplot(aes(month, pred_mean, 
+             ymin = pred_mean-2*pred_sd, 
+             ymax = pred_mean+2*pred_sd, group = guid)) + 
+  geom_jitter(aes(y = npev_npafp_p), 
+             col = "grey", alpha = 0.5, cex = 0.2) +
+  geom_ribbon(alpha = 0.2, fill = "lightsteelblue") + 
+  geom_line(alpha = 0.2, col = "steelblue4") + 
+  labs(y = "Estimated prevalence", x = "Month", title = "Predicted mean & SD")
+
+```
+Minimal difference between median and mean => use mean & SD as inputs to ES detection model. 
+
+### Annual averages
+
+```{r}
+
+data_wpred |> 
+  group_by(guid, year) |> 
+  summarise(pred_mean = mean(pred_mean),
+            pred_sd = mean(pred_sd)) |>
+  ungroup() |>
+  right_join(shape2) -> tmp
+
+tmp |> 
+  ggplot(aes(fill = pred_mean, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~year) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence") + 
+  theme_void()
+tmp |> 
+  ggplot(aes(fill = pred_sd, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~year) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence - SD") + 
+  theme_void()
+
+```
+### Monthly
+
+Look at spatial trends per quarter, across years.
+
+```{r}
+
+data_wpred |> 
+  filter(period %% 0.25 == 0) |> 
+  right_join(shape2) -> tmp
+
+tmp |> 
+  ggplot(aes(fill = pred_mean, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~month) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence") + 
+  theme_void()
+tmp |> 
+  ggplot(aes(fill = pred_sd, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~month) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence - SD") + 
+  theme_void()
+
+```
