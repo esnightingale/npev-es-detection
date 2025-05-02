@@ -88,7 +88,7 @@ afp <- afp_ |>
   # exclude AFP among over-15s 
   filter(age_m < 15*12) |>
   # Aggregate to district and month
-  group_by(place_admin_1, guid, month) |> 
+  group_by(guid, month) |> 
   summarise(n_afp = n(),
             n_npafp = sum(npafp, na.rm = T),
             n_npev = sum(npev == "Yes", na.rm = T)) |> 
@@ -104,7 +104,7 @@ afp <- afp_ |>
   # Add population density
   full_join(shape2 |> 
               st_drop_geometry() |> 
-              select(guid, guid_total_pop, guid_pop_dens), by = "guid") 
+              select(adm1_name, guid, guid_total_pop, guid_pop_dens), by = "guid") 
 
 # Note: Some denominators are imputed (all for 2021)
 
