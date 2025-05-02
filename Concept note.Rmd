@@ -1,0 +1,120 @@
+---
+title: 'Concept note: Sensitivity of ES to NPEV in Pakistan'
+output:
+  word_document: default
+  html_document:
+    df_print: paged
+---
+
+# Motivation
+
+Confidence in the interruption of poliovirus transmission is highly dependent on assumed sensitivity of environmental surveillance (ES), in particular in the case of cVDPV2 (low rate of clinical disease). In the WPV-endemic setting of Pakistan, the nature of collection sites varies considerably between natural waterways, informal drainage channels, and more formal sewage treatment plants and pumping stations. These different types of site will likely have very different population catchment and virus detection sensitivities. Some site types may also be more consistently sensitive over time than others.
+
+Previous work has explored how the strength of evidence against ongoing circulation is influenced by variation in which sites (in which locations, relative to the distribution of population) are reporting samples at what time. This work also incorporated detection rate of NPEVs as another source of variation between sites, hence variation in the strength of evidence for absence in that location when no poliovirus has been detected.
+
+The latter indicator was considered only with respect to a fixed target rate defined by the GPEI (>50%), which is used to monitor site performance and inform their opening/closure. This means that sites detecting NPEVs in an average of 50% of collected samples over the previous 12 months are considered as performing at their "maximum", with our measurement of sensitivity scaled down when this value falls below 50%. In fact, the 50% threshold is arbitrarily defined and doesn't necessarily align with the expected prevalence of NPEVs in the population, in different locations and at different times of year.
+
+We can interrogate site sensitivity in more depth by estimating the underlying prevalence of NPEV between districts and over time from notified cases of non-polio AFP, then comparing this to ES detections of NPEV. As Pakistan is a WPV-endemic country with strong emphasis on AFP surveillance, we assume that the prevalence among notified non-polio AFP is a reasonable proxy for the prevalence of NPEV infection in the at-risk population overall (under 15y). 
+
+This was done in a previous analysis by Kroiss et al. (2018) using ES data from 2009-16. This was before the substantial expansion of ES in Pakistan and the analysis of site sensitivity to NPEV was limited by low power. We can revisit this analysis with more recent, more extensive surveillance data and try to explore not only variability between sites overall, but in site-specific sensitivity over time. We will take a particular focus on the consistency of sensitivity at WWTPs and pumping stations, compared to other site types.  
+
+## Hypothesis
+
+That the sensitivity of ES to NPEV in Pakistan varies between site types and over time, with WWTPs and pumping stations showing more consistent sensitivity than other site types.
+
+## Objectives
+
+1. To estimate the monthly, district-level prevalence of NPEV in the population under 15y in Pakistan, from notified cases of non-polio AFP. 
+
+2. To estimate the probability of NPEV detection in ES samples, relative to this estimated district-level prevalence. 
+
+3. Using the model fit in (2), investigate the interaction between site type and time, with respect to the probability of NPEV detection in ES samples.
+
+# Methods
+
+## Data setup
+
+Analysis datasets:
++ Environmental samples
+  - District
+  - Site ID
+  - Site coords
+  - Sample ID
+  - Month of collection
+  - Year of collection
+  - NPEV positive (Y/N)
+  - Poliovirus positive (Y/N)
++ AFP cases
+  - District 
+  - NPAFP denominator
+  - Month of notification
+  - Year of notification
+  - NPEV positive count
+  - Poliovirus positive count
++ Gridded population estimates
+  - Worldpop constrained (to mapped buildings/settlements) and UN-adjusted 100m estimates, 2020 [https://hub.worldpop.org/geodata/summary?id=50043]
+    - Choose constrained since this doesn't attribute non-zero counts to uninhabited areas (assuming majority of pakistan's population is in mapped settlements?)
+  - Novel-T blueline-estimated watersheds [https://www.novel-t.ch/]
+
+## Analysis
+
+### Descriptive
+
++ Number of samples collected, total and monthly
++ Map location of unique sites
++ Proportion of samples NPEV+
+
++ Number of AFP cases reported, total and monthly
++ District rate of NPAFP cases per 100,000 U15 population, total and monthly
++ Proportion of AFP cases NPEV+
++ District average population density
+
+### Model setup
+
+1. NPEV prevalence model
+
+Number of NPEV+ AFP cases in district $i$ at time $t$:
+
+$$ Y_{i,t} \sim  Binomial(M_{i,t}, p_{i,t}) $$
+where $M_{i,t}$ is the number of notified AFP cases and $p_{i,t}$ is the prevalence of NPEV in this population (to be estimated).
+
+$$ logit(p_{i,t}) = \beta_0 + \beta_1*[popdens] + f^{BYM}(i) + f^{AR1}(month(t)) + f^{RW1}(t)$$
+Fit this using brms with BYM spatial random effect, AR1 and RW1 temporal effects. Extract predicted prevalence for each district at each time point and associated standard error. 
+
+2. ES detection model
+
+Binary detection of NPEV in sample $j$ from site $s$ at time $t$:
+
+$$ X_{j,s,t} \sim  Bernoulli(q_{j,s,t}) $$
+
+where $q_{j,s,t}$ is the probability of detecting NPEV, given district prevalence $p_{i,t}$.
+
+$$ logit(q_{j,s,t}) = \gamma_0 + \gamma_s*log(p_{i,t}) + f_{s,t}(month(t)) $$
+
+### Site type
+
+I will also fit an alternate to model (2) only distinguishing sites by their type (WWTP vs other) and explore the interaction between site type and time. 
+
+### Model evaluation
+
+xxxxx
+
+# Results
+
+## Descriptive
+
+The notification rate of AFP cases (per 100,000 under-15s) and the proportion of collected ES samples that are positive for NPEV are two key indicators of surveillance quality used by the GPEI. I will summarise these rates by district and over time for this period, interpreting with respect to the defined target thresholds. 
+
+I will map the active ES system and describe the distribution of sites by type, sampling frequency and NPEV positivity rate. I will summarised inferred population catchment size at each site with respect to (a) a fixed Xkm radius, and (b) estimated watershed area from Novel-T bluelines. 
+
+I will also define the district of a site with respect to (a) the location of the site itself, and (b) the district in which the majority of the inferred population catchment falls. For the primary analysis, ES observations will be associated with district NPEV  prevalence according to the district in which the site falls. As a sensitivity analysis, ES observations will alternatively be associated to district NPEV prevalence according to the latter definition. I will also explore mapping the ES observations proportionally to multiple districts across which the catchment falls. 
+
+## Primary analysis
+
+I will present the fitted temporal trends from the district-level model, to demonstrate how NPEV prevalence is expected to vary seasonally across the year. This will need to take into account a potential shift during the severe floods of July/August 2022 (which fall in the middle of this time period). I will also present the estimated district-level prevalence of NPEV and the associated standard error, which are then fed into the ES detection model.
+
+I will interpret the strength of the association between estimated district-level prevalence and the probability of detection per ES site from the ES model. I will map the estimated site-specific random effects from this model over time and space, and interpret the fitted standard deviations of these random effects. This will indicate the extent to which sensitivity varies between sites. 
+
+# Discussion
+
+This analysis will provide evidence as to how the sensitivity of ES to NPEV varies between site types and over time in Pakistan. This will help to inform the interpretation of ES data in the context of poliovirus surveillance, as well as giving insight into other non- or mixed-sewered settings. Such settings are likely to have the most to gain from ES in addition to case-based surveillance, but we need to understand the limitations of ES in these settings in order to define the most informative combined systems for inference. 

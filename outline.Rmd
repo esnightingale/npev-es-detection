@@ -79,7 +79,7 @@ Number of NPEV+ AFP cases in district $i$ at time $t$:
 $$ Y_{i,t} \sim  Binomial(M_{i,t}, p_{i,t}) $$
 where $M_{i,t}$ is the number of notified AFP cases and $p_{i,t}$ is the prevalence of NPEV in this population (to be estimated).
 
-$$ logit(p_{i,t}) = \beta_0 + \beta_1*[popdens] + f^{BYM}(i) + f^{AR1}(month(t)) + f^{RW1}(t)$$
+$$ logit(p_{i,t}) = \beta_0 + \beta_1*[popdens] + f^{BYM}(i) + f^{cc}(month(t)) + f^{RW1}(t)$$
 Fit this using brms with BYM spatial random effect, AR1 and RW1 temporal effects. Extract predicted prevalence for each district at each time point and associated standard error. 
 
 2. ES detection model
