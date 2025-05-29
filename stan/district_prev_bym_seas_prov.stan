@@ -98,6 +98,7 @@ parameters {
   vector[Nloc] nszcar;  // non-spatial part
   // proportion of variance in the spatial part
   real<lower=0,upper=1> rhocar;
+  real<lower=0> sigma_w;  // Random walk SD
 }
 transformed parameters {
   // penalized spline coefficients
@@ -157,7 +158,7 @@ model {
   if (!prior_only) {
     // initialize linear predictor term
     vector[N] mu = rep_vector(0.0, N);
-    mu += Intercept + Xc * b + Zs_1_1 * s_1_1 + Zs_2_1 * s_2_1 + Zs_3_1 * s_3_1 + Zs_4_1 * s_4_1 + Zs_5_1 * s_5_1 + Zs_6_1 * s_6_1 + Zs_7_1 * s_7_1;
+    mu += Intercept + rw + Xc * b + Zs_1_1 * s_1_1 + Zs_2_1 * s_2_1 + Zs_3_1 * s_3_1 + Zs_4_1 * s_4_1 + Zs_5_1 * s_5_1 + Zs_6_1 * s_6_1 + Zs_7_1 * s_7_1;
     for (n in 1:N) {
       // add more terms to the linear predictor
       mu[n] += rcar[Jloc[n]];
@@ -179,8 +180,13 @@ model {
   target += normal_lpdf(sum(zcar) | 0, 0.001 * Nloc);
   // proper prior on the non-spatial BYM2 component
   target += std_normal_lpdf(nszcar);
+  // Random walk prior
+  rw[1] ~ normal(0, 1);
+  for(t in 2:N) {
+    rw[t] ~ normal(rw[t-1], sigma_w);
+  }
 }
 generated quantities {
   // actual population-level intercept
-  real b_Intercept = Intercept - dot_product(means_X, b);
+  real b_Intercept = Intercept + rw - dot_product(means_X, b);
 }
