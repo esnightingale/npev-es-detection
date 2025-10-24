@@ -1,0 +1,549 @@
+---
+title: "Summarise prevalence model fit"
+output: html_notebook
+---
+
+
+```{r}
+
+pacman::p_load(tidyverse, here, gtsummary, 
+               sf, spdep, 
+               rstan, brms, tidybayes, bayesplot, 
+               units, loo, posterior)
+theme_set(theme_minimal())
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir <- "data/Pakistan"
+
+# source("./utils/fit_npafp_model.R")
+source("./utils/check_model_fit.R")
+
+# Analysis dataset
+fitdata <- readRDS(here(dir, "fitdata.rds"))
+
+# Shapefiles and adjacency matrix
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+W <- readRDS(here(dir,"W.rds"))
+
+# Baseline brms fit
+fit_base <- readRDS("output/fit_base.rds")
+
+```
+
+
+## Random walk
+
+First refit BYM model without time random intercepts, to extract stan code and data.
+```{r}
+
+f_bym2 = bf(
+  n_npev | trials(n_npafp) ~ 
+    # Overall average prevalence
+    1 + 
+    # Correlated/uncorrelated random deviations by district 
+    car(W, gr = guid, type = "bym2") + 
+    # Seasonal temporal spline
+    s(month_of_year, bs = "cc", k = 12) 
+  )
+
+fit_bym2 <- update(fit_base, 
+                  formula = f_bym2,
+                  newdata = fitdata,
+                  data2 = list(W = W),
+                  prior = prior_bym,
+                  recompile = T,
+                  file = "output/fit_bym2.rds") 
+
+stan_bym2 <- stancode(fit_bym2)
+cmdstanr::write_stan_file(stan_bym2,
+                          dir = here("stan"),
+                          basename = "district_prev_bym2.stan")
+
+```
+
+### Overall
+
+Now add a temporal random walk in place of exchangeable random intercepts: 
+```{r}
+
+# Extract data from existing brms fit
+stan_data <- standata(fit_bym2)
+
+# Add time indexing to match amended stan code
+tid <- as.integer(factor(fitdata$t))   # 1 … Ntime
+stan_data$Ntime <- max(tid)
+stan_data$Jtime <- tid
+
+# Recompile from edited stan code (adding district RWs) and sample
+mod_rw <- cmdstanr::cmdstan_model("stan/district_prev_bym_RW.stan")
+fit_rw <- mod_rw$sample(
+  data = stan_data,
+  seed = 123,
+  refresh = 250,
+  init = 0.2,
+  chains = 4,
+  parallel_chains = parallel::detectCores(),
+  iter_sampling = 2000,
+  iter_warmup = 1000
+)
+
+# Save output
+fit_rw$save_object("output/fit_bym_RW_cmdstanr.rds")
+
+```
+
+#### Check fit
+
+```{r}
+
+fit_rw$diagnostic_summary()
+
+```
+
+```{r}
+
+print(names(draws.df))
+fit_rw$summary(variables = c("Intercept","sds_1[1]","sdcar","rhocar","sdrw")) -> summary_tab
+
+summary_tab
+summary_tab |>
+  ggplot(aes(y = variable, x = mean, xmin = q5, xmax = q95)) +
+  geom_vline(xintercept = 0, lty = "dashed", col = "darkgrey") +
+  geom_errorbarh() +
+  labs(x = "Posterior summary")
+
+```
+
+### District-specific
+
+District-specific random walks in place of district-specific IID by time.
+
+```{r}
+
+# Recompile from edited stan code (adding district RWs) and sample
+mod_rw_d <- cmdstanr::cmdstan_model("stan/district_prev_bym_RWd.stan")
+fit_rw_d <- mod_rw_d$sample(
+  data = stan_data,
+  seed = 123,
+  refresh = 250,
+  init = 0.2,
+  chains = 4,
+  parallel_chains = parallel::detectCores(),
+  iter_sampling = 2000,
+  iter_warmup = 1000
+) # Finished in ~1h
+
+# Save output
+fit_rw_d$save_object("output/fit_bym_RWd_cmdstanr.rds")
+
+# Create stanfit object
+# stanfit <- rstan::read_stan_csv(fit_rw$output_files())
+# saveRDS(stanfit, "output/fit_bym_RWd_stanfit.rds")
+
+```
+
+
+#### Check fit
+
+```{r}
+
+fit_rw_d$diagnostic_summary()
+
+```
+
+```{r}
+
+fit_rw_d$summary(variables = c("Intercept","sds_1[1]","sdcar","rhocar","sdrw_d")) -> summary_tab
+
+summary_tab
+summary_tab |>
+  ggplot(aes(y = variable, x = mean, xmin = q5, xmax = q95)) +
+  geom_vline(xintercept = 0, lty = "dashed", col = "darkgrey") +
+  geom_errorbarh() +
+  labs(x = "Posterior summary")
+
+```
+Very uncertain SD for district-specific RWs, rho not identifiable between 0 and 1, and intercept also very undertain. 
+
+### Province-specific 
+
+```{r}
+
+# Add province indexing to standata
+prov_id <- as.integer(factor(fitdata$adm1_name))
+stan_data$Nprov <- max(prov_id)
+stan_data$Jprov <- prov_id
+
+# Recompile from edited stan code (adding province RWs) and sample
+mod_rw_p <- cmdstanr::cmdstan_model("stan/district_prev_bym_RWp.stan")
+fit_rw_p <- mod_rw_p$sample(
+  data = stan_data,
+  seed = 123,
+  refresh = 250,
+  init = 0.2,
+  chains = 4,
+  parallel_chains = 4,
+  iter_sampling = 2000,
+  iter_warmup = 1000
+)
+
+# Save output
+fit_rw_p$save_object("output/fit_bym_RWp_cmdstanr.rds")
+
+```
+
+```{r}
+
+fit_rw_p$diagnostic_summary()
+
+```
+
+### Compare models
+
+```{r}
+
+waic(fit_base, fit_bym, fit_bym_prov)
+loo(fit_base, fit_bym, fit_bym_prov)
+
+fit_rw$loo()
+fit_rw_d$loo()
+# fit_rw_p$loo()
+
+```
+
+Extract draws:
+
+```{r}
+
+# Extract all draws as a draws_array or draws_df
+draws <- fit_rw$draws()
+draws.df <- as_draws_df(draws)
+
+# Get the variable names 
+variables <- variables(draws)
+```
+
+## Fit checks
+
+### Posterior predictive checks
+
+```{r}
+
+y_rep <- fit_rw$draws("y_pred", format = "matrix")
+epred <- fit_rw$draws("epred", format = "matrix")
+
+summary(fitdata$npev_npafp_p)
+summary(as.numeric(epred))
+
+ppc_dens_overlay(y = fitdata$npev_npafp_p, yrep = epred[1:200,])
+ppc_scatter_avg(y = fitdata$npev_npafp_p, yrep = epred[1:200,])
+ppc_bars(y = fitdata$n_npev, yrep = y_rep[1:200,])
+ppc_rootogram(y = fitdata$n_npev, yrep = y_rep[1:200,])
+
+```
+
+## LOO
+
+```{r}
+
+fit_rw$loo()
+
+```
+
+# Summary of key scalar parameters
+
+```{r}
+
+summary_tab <- posterior::summarise_draws(draws[,,c("Intercept", "sdcar", "rhocar", "sdrw_d", "sds_1[1]")])
+
+mcmc_hist(fit_rw$draws(c("Intercept", "sdcar", "rhocar", "sdrw_d", "sds_1[1]")))
+
+```
+
+```{r}
+
+posterior <- as.matrix(fit_rw)
+
+color_scheme_set("red")
+ppc_bars(y = fit$y,
+                 yrep = posterior_predict(fit, draws = 50))
+```
+
+Plot fitted seasonal spline:
+
+```{r}
+
+
+```
+
+Explore district-specific random walks (as deviations from seasonal trend):
+
+```{r}
+
+# Extract shape info
+n_iter <- dim(draws)[1]*4
+n_district <- n_distinct(fitdata$guid)
+n_time <- max(time_id)
+
+# Convert rw_d_matrix to 3D array: (iterations × chains) × district × time
+rw_d_array <- array(NA, dim = c(n_district, n_time, n_iter))
+
+for (d in 1:n_district) {
+  for (t in 1:n_time) {
+    varname <- paste0("rw_dev[", d, ",", t, "]")
+    tmp <- fit_rw$draws(variables = varname)[,,1] |> 
+      as_tibble() |> 
+      pivot_longer(everything())
+    rw_d_array[d, t, ] <- tmp$value
+  }
+}
+
+```
+
+Plot mean RW across draws:
+
+```{r}
+
+apply(rw_d_array,1:2,mean) -> sum_rw_d
+
+sum_rw_d |> 
+  as_tibble() |> 
+  rowid_to_column("distid") |> 
+  pivot_longer(-distid, names_prefix = "V", names_to = "t") |> 
+  mutate(t = as.numeric(t)) |> 
+  ggplot(aes(t,value, group = distid)) + 
+  geom_line(alpha = 0.5) + 
+  labs(x = "Time", y = "RW deviation")
+
+```
+
+
+```{r}
+
+# Example: plot random walk for district 1
+rw1 <- fit_rw$draws("rw_dev[1,1]", format = "matrix")
+rw1_median <- apply(rw1, 2, median)
+rw1_q10 <- apply(rw1, 2, quantile, 0.1)
+rw1_q90 <- apply(rw1, 2, quantile, 0.9)
+
+time <- 1:ncol(rw1)
+plot(time, rw1_median, type = "l", ylim = range(rw1_q10, rw1_q90))
+lines(time, rw1_q10, col = "gray")
+lines(time, rw1_q90, col = "gray")
+
+posterior_samples <- fit_rw$draws(variables = c("rw_d", "sdrw_d", "b", "b_Intercept"), format = "draws_df")
+
+# Assuming posterior_samples is a matrix or data.frame
+rw_df <- as.data.frame(posterior_samples) %>%
+  select(starts_with("rw_d")) %>% 
+  pivot_longer(cols = everything(), names_to = "rw_idx", values_to = "rw_val") %>%
+  mutate(t = as.integer(gsub("rw_d\\[|\\]", "", rw_idx))) |> View()
+  left_join(fitdata |> select(month, t) |> distinct()) 
+
+ggplot(rw_df, aes(x = month, y = rw_val)) +
+  stat_summary(fun = mean, geom = "line") +
+  stat_summary(fun.data = mean_cl_normal, geom = "ribbon", alpha = 0.3) +
+  labs(title = "Estimated Random Walk Trend", y = "Effect (logit scale)", x = "Time")
+
+```
+
+Check fit
+```{r}
+
+fit_rw
+
+posterior_samples <- fit_rw$draws(variables = c("rw_dev", "sdrw", "b", "b_Intercept"), format = "draws_df")
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+
+
+```
+
+### Model comparison
+```{r}
+
+fits <- list(fit_base, fit_bym, fit_bym_prov)
+
+fits <- lapply(fits, 
+       add_criterion, 
+       c("waic"), #,"loo"
+       moment_match = TRUE)
+
+# Compare models
+lapply(fits, loo::waic)
+# loo::loo_compare(fits)
+
+```
+
+Select final model for prediction:
+
+```{r}
+
+fit_prev <- fits[[2]]
+
+```
+
+## Extract posterior draws and plot 
+
+```{r}
+
+# posterior_samples <- as_draws_df(fit_prev)  
+# 
+# # Extract RW component 
+# rw_t <- posterior_samples |>  select(starts_with("r_t"))  
+# 
+# # Summarise across draws
+# rw_summary <- rw_t |> 
+#   pivot_longer(cols = everything(), names_to = "time", values_to = "rw_value") |>
+#   mutate(time = as.numeric(gsub("r_t\\[", "", gsub(",Intercept\\]", "", time)))) |>
+#   group_by(time) |> 
+#   summarise(
+#     mean_rw = mean(rw_value),
+#     lower = quantile(rw_value, 0.025),
+#     upper = quantile(rw_value, 0.975)
+#   ) 
+#   # # Transform to probability scale
+#   # mutate(across(mean_rw:upper, \(x) exp(x)/(1+exp(x))))
+# 
+# ggplot(rw_summary, aes(x = time, y = mean_rw)) +
+#   geom_line(color = "steelblue") +
+#   geom_ribbon(aes(ymin = lower, ymax = upper), 
+#               alpha = 0.2, fill = "steelblue") +
+#   theme_minimal() +
+#   labs(
+#     title = "Estimated first-order random walk",
+#     x = "Time",
+#     y = "Estimate"
+#   )
+
+```
+
+-> Downward shift at the end of 2022? 
+
+# Predict prevalence by district-month
+
+Set at least one NP-AFP case per district-month to force prediction > 0.
+
+```{r}
+
+newdata <- fitdata
+newdata$n_npafp[newdata$n_npafp == 0] <- 1
+
+# Extract predictions
+pred_prev <- posterior_epred(fit_prev, 
+                             newdata = newdata, 
+                             scale = "linear")
+
+# Summarise 
+pred_summary <- as.data.frame(t(apply(pred_prev, 
+                                      2, 
+                                      quantile, 
+                                      probs = c(0.025, 0.5, 0.975))))
+colnames(pred_summary) <- c("lower", "median", "upper")
+
+# Add to data and scale to prevalence
+data_wpred <- newdata |> 
+  mutate(pred_lo = pred_summary$lower,
+         pred_med = pred_summary$median,
+         pred_hi = pred_summary$upper, 
+         pred_mean = apply(pred_prev, 2, mean),
+         pred_sd = apply(pred_prev, 2, sd),
+         across(starts_with("pred"), \(x) x/n_npafp)) 
+
+```
+
+## Check 
+
+```{r}
+
+data_wpred |> 
+  select(pred_lo:pred_sd) |> 
+  summary()
+
+summary(data_wpred$pred_med - data_wpred$pred_mean)
+
+```
+
+## Plotting
+
+### By month and district
+
+```{r}
+
+data_wpred |> 
+  ggplot(aes(month, group = guid)) + 
+  geom_jitter(aes(y = npev_npafp_p), 
+             col = "grey", alpha = 0.5, cex = 0.2) +
+  geom_ribbon(aes(ymin = pred_lo, ymax = pred_hi), 
+              alpha = 0.2, fill = "lightsteelblue") + 
+  geom_line(aes(y = pred_med), alpha = 0.2, col = "steelblue4") + 
+  # geom_line(aes(y = pred_mean), col = "red", alpha = 0.1) +
+  labs(y = "Estimated prevalence", x = "Month", title= "Predicted median & quantiles")
+
+data_wpred |> 
+  ggplot(aes(month, pred_mean, 
+             ymin = pred_mean-2*pred_sd, 
+             ymax = pred_mean+2*pred_sd, group = guid)) + 
+  geom_jitter(aes(y = npev_npafp_p), 
+             col = "grey", alpha = 0.5, cex = 0.2) +
+  geom_ribbon(alpha = 0.2, fill = "lightsteelblue") + 
+  geom_line(alpha = 0.2, col = "steelblue4") + 
+  labs(y = "Estimated prevalence", x = "Month", title = "Predicted mean & SD")
+
+```
+Minimal difference between median and mean => use mean & SD as inputs to ES detection model. 
+
+### Annual averages
+
+```{r}
+
+data_wpred |> 
+  group_by(guid, year) |> 
+  summarise(pred_mean = mean(pred_mean),
+            pred_sd = mean(pred_sd)) |>
+  ungroup() |>
+  right_join(shape2) -> tmp
+
+tmp |> 
+  ggplot(aes(fill = pred_mean, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~year) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence") + 
+  theme_void()
+tmp |> 
+  ggplot(aes(fill = pred_sd, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~year) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence - SD") + 
+  theme_void()
+
+```
+### Monthly
+
+Look at spatial trends per quarter, across years.
+
+```{r}
+
+data_wpred |> 
+  filter(period %% 0.25 == 0) |> 
+  right_join(shape2) -> tmp
+
+tmp |> 
+  ggplot(aes(fill = pred_mean, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~month) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence") + 
+  theme_void()
+tmp |> 
+  ggplot(aes(fill = pred_sd, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~month) +
+  scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence - SD") + 
+  theme_void()
+
+```

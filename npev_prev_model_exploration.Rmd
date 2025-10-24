@@ -1,0 +1,938 @@
+---
+title: 'Part 1: District NPEV prevalence'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+library(devtools)
+if(!require(cmdstanr)){
+  devtools::install_github("stan-dev/cmdstanr", dependencies=c("Depends", "Imports"))
+}
+if(!require(INLA)){
+install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, spdep, rstan, brms, tidybayes, bayesplot, units, loo, posterior, cmdstanr, INLA, geostan)
+theme_set(theme_minimal())
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir <- "data/Pakistan"
+
+# source("./utils/fit_npafp_model.R")
+source("./utils/check_model_fit.R")
+
+# NP-AFP analysis data
+data <- readRDS(here(dir, "afp_analysis.rds"))
+
+# Shapefiles and adjacency matrix
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+W <- readRDS(here(dir,"W.rds"))
+
+```
+
+```{r}
+plot_pp_checks <- function(fit){
+  
+  check_plots <- list(pp_check(fit, type = "bars"), 
+                      pp_check(fit, type = "scatter_avg"),
+                      pp_check(fit, "rootogram"))  
+  return(check_plots)
+}
+```
+
+# Descriptive
+
+```{r}
+
+data |> 
+  tbl_summary(include = c(n_afp, n_npafp, n_npev, npafp_r, npev_npafp_p),
+              by = year,
+              label = list(n_afp = "AFP notifications", 
+                           n_npafp = "Non-polio AFP notifications", 
+                           n_npev = "NPEV positives", 
+                           npafp_r = "Non-polio AFP rate (per 100,000 U15s)", 
+                           npev_npafp_p = "Crude NPEV prevalence")) |> 
+  add_overall() |> 
+  as_gt()
+
+```
+
+Plot crude NPEV prevalence among notified non-polio AFP cases, per district and over time:
+
+```{r}
+
+data |> 
+  group_by(month) |> 
+  summarise(across(c("n_afp", "denominator"), sum),
+            r_afp = n_afp*1e5/denominator,
+            lo = Hmisc::binconf(n_afp, denominator)[2]*1e5,
+            hi = Hmisc::binconf(n_afp, denominator)[3]*1e5) |>
+  ggplot(aes(month, r_afp, ymin = lo, ymax = hi)) +
+  geom_ribbon(alpha = 0.5) +
+  geom_line() + 
+  labs(x = "Month", y = "AFP rate per 100,000")
+
+# Overall NPAFP rate
+data |> 
+  group_by(month) |> 
+  summarise(across(c("n_npafp","n_npev", "denominator"), sum),
+            r_npafp = n_npafp*1e5/denominator,
+            lo = Hmisc::binconf(n_npafp, denominator)[2]*1e5,
+            hi = Hmisc::binconf(n_npafp, denominator)[3]*1e5) |>
+  ggplot(aes(month, r_npafp, ymin = lo, ymax = hi)) +
+  geom_ribbon(alpha = 0.5) +
+  geom_line() + 
+  labs(x = "Month", y = "NPAFP rate per 100,000")
+
+# Annual NPEV+ rate by district
+data |> 
+  group_by(guid, year) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  right_join(shape2) |> 
+  ggplot(aes(fill = r_npev, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~year) +
+  scale_fill_viridis_c(name = "NPEV+\nPrevalence", trans = "sqrt") + 
+  theme_void() -> p_obs_dist_yr
+
+# Seasonal trend, by year
+data |> 
+  group_by(month_of_year, year) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = factor(year), col = factor(year), fill = factor(year))) + 
+  geom_point() + 
+  geom_smooth() + 
+  # guides(fill = "none") +
+  labs(x = NULL, y = "NPEV+ Prevalence", col = "Year", fill = "Year") -> p_obs_mth_yr
+
+# Seasonal trend, by province
+data |> 
+  group_by(month_of_year, adm1_name) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = adm1_name, col = adm1_name, fill = adm1_name)) + 
+  # geom_jitter(alpha = 0.2) + 
+  geom_smooth(alpha = 0.5) + 
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_prov
+
+# Seasonal trend, by district
+data |> 
+  group_by(month_of_year, guid) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = guid)) + 
+  # geom_jitter(alpha = 0.2) + 
+  geom_smooth(alpha = 0.1, lwd = 0.2, se = F) + 
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_dist
+
+# Correlation with population density
+data |> 
+  group_by(guid_pop_dens, guid) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = as.numeric(guid_pop_dens), y = r_npev)) + 
+  geom_jitter(alpha = 0.2) +
+  geom_smooth(alpha = 0.1, lwd = 0.2, se = T) + 
+  scale_x_continuous(trans = "log10") +
+  labs(x = "Log population density (/km2)", y = "NPEV+ Prevalence") -> p_obs_dens_dist
+
+p_obs_mth_yr
+p_obs_dist_yr
+p_obs_mth_prov
+p_obs_mth_dist
+p_obs_dens_dist
+
+```
+
+Overall decrease year on year, with more pronounced seasonality in 2021. 
+
+# Modelling 
+
+## Model setup
+
+1. NPEV prevalence model
+
+Number of NPEV+ AFP cases in district $i$ at time $t$:
+
+$$ Y_{i,t} \sim  Binomial(M_{i,t}, p_{i,t}) $$
+where $M_{i,t}$ is the number of notified AFP cases and $p_{i,t}$ is the estimated prevalence of NPEV in this sampled population.
+
+The prevalence per district-month is dependent on population density, spatial correlation between neighbouring districts, a seasonal trend and a 1st order random walk:
+
+$$ logit(p_{i,t}) = \beta_0 + \beta_1*[popdens] + f^{BYM}(i) + f^{cc}(month(t)) + f^{RW1}(t)$$
+The predicted prevalence and SE for each district-month will be extracted for input as a predictor of NPEV detection probability in subsequent ES model. 
+
+2. ES detection model
+
+Binary detection of NPEV in sample $j$ from site $s$ at time $t$:
+
+$$ X_{j,s,t} \sim  Bernoulli(q_{j,s,t}) $$
+
+where $q_{j,s,t}$ is the probability of detecting NPEV, given district prevalence $p_{i,t}$.
+
+$$ logit(q_{j,s,t}) = \gamma_0 + \gamma_s*log(p_{i,t}) + f_{s,t}(month(t)) $$
+The relation $i~j$ will be defined according to three options: 
+- Site $j$ point location is within district $i$
+- Majority watershed of site $j$ intersects with district $i$
+- Any watershed of site $j$ intersects with district $i$ where $i \in I$, using a weighted average of $p_{i,t}$ over all $i \in I$. [Question: How to average SE?]
+
+Other notes:
+Based on Kroiss et al. analysis, NPEV prevalence was around 25% per month. 
+ => N(-1,1) informative prior on the global intercept. 
+
+## Model Fitting
+
+Setting up data for fitting:
+
+```{r}
+
+fitdata <- mutate(data, 
+                  month_of_year = as.numeric(month_of_year),
+                  year_F = factor(year),
+                  guid_F = factor(guid, levels = unique(data$guid)),
+                  t_F = factor(t, levels = 1:max(data$t)),
+                  # standardise pop density for stability
+                  log_pop_dens = log(guid_pop_dens) |> as.numeric(),
+                  log_pop_dens_s = (log_pop_dens - mean(log_pop_dens))/sd(log_pop_dens)) 
+
+readr::write_rds(fitdata, "data/Pakistan/fitdata.rds")
+```
+
+### Baseline model {.tabset}
+
+Overall intercept, IID district and month random effects, and periodic spline for seasonal trend.
+
+#### Formula and priors
+
+```{r}
+
+f_base = bf(
+  n_npev | trials(n_npafp) ~ 
+    # Overall average prevalence
+    1 + 
+    # Random deviations per district and time
+    (1|guid) + (1|t) + 
+    # Periodic spline for seasonality
+    s(month_of_year, bs = "cc", k = 12))
+
+# Check default priors given this formula
+get_prior(f_base, fitdata, family = binomial("logit"))
+
+```
+
+"Flat" prior is improper, essentially infinitely small density across -Inf to +Inf. 
+
+```{r}
+
+student::rStudent(10000,3, scale = 2.5) |> hist()
+rexp(10000,0.5) |> hist()
+rexp(10000,1) |> hist()
+boot::inv.logit(rnorm(10000, 0,1)) |> hist()
+
+# Respecify priors to be more informative
+prior_base <- c(prior(normal(0,1), class = Intercept),
+                prior(exponential(0.5), class = sd),
+                prior(exponential(1), class = sds))
+
+```
+
+#### Prior checks
+
+```{r}
+
+pp_base <- brm(f_base, 
+               data = fitdata,
+               data2 = list(W = W),
+               family = "binomial",
+               prior = prior_base,
+               sample_prior = "only") 
+
+```
+
+```{r}
+
+summary(pp_base)
+plot(pp_base)
+
+plot_pp_checks(pp_base)
+
+```
+
+#### Fitting
+
+```{r}
+
+fit_base <- brm(f_base, 
+               data = fitdata,
+               data2 = list(W = W),
+               family = "binomial",
+               prior = prior_base,
+               refresh=250,
+               empty=FALSE, init=0.2,
+               iter = 2000, chains = 4, 
+               cores = parallel::detectCores(),
+               control = list(adapt_delta = 0.96),
+               save_pars = save_pars(all = T),
+               file_refit = "on_change",
+               file = "output/fit_base.rds") 
+
+```
+
+#### Check fit
+
+```{r}
+summary(fit_base)
+bayes_R2(fit_base)
+```
+
+```{r}
+
+mcmc_areas(fit_base, 
+           pars = get_variables(fit_base)[1:4])
+
+# Prior predictive checks
+plot_pp_checks(fit_base)
+
+# Trace plots
+plot(fit_base)
+
+# Residuals
+check_residuals(fit_base, 
+                data = fitdata, 
+                shapefile = shape2)
+
+```
+
+Fitted random effects:
+
+```{r}
+
+fit_base %>%
+  gather_draws(r_guid[guid, Intercept]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid, adm1_name) |> distinct()) -> summ_r_guid
+
+summ_r_guid |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", col = "Province") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+
+fit_base %>%
+  gather_draws(r_t[t, Intercept]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, t, month) |> distinct()) -> summ_r_t
+
+summ_r_t |>  
+  ggplot(aes(month, .value,
+             ymin = .lower, ymax = .upper)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "Month", y = "Posterior estimate")
+```
+
+```{r}
+
+plot(conditional_smooths(fit_base))
+
+```
+
+### Adding spatial correlation {.tabset}
+
+#### Formula and priors
+```{r}
+
+f_bym = bf(
+  n_npev | trials(n_npafp) ~ 
+    # Overall average prevalence
+    1 + 
+    # Random deviations by time
+    (1|t) +
+    # Correlated/uncorrelated random deviations by district 
+    car(W, gr = guid, type = "bym2") + 
+    # Seasonal temporal spline
+    s(month_of_year, bs = "cc", k = 12) 
+  )
+
+# Check default priors given this formula
+get_prior(f_bym, 
+          data = fitdata, data2 = list(W = W), 
+          family = binomial("logit"))
+
+rbeta(10000,1,1) |> hist()
+rbeta(10000,1,2) |> hist()
+rbeta(10000,0.5,0.5) |> hist()
+
+# PC prior for sdcar s.t. P((1/sqrt(tau)) > 1) = 0.01 => exp(theta)
+# Regularising prior for rho that puts more density on a lesser contribution of spatial component
+prior_bym <- c(prior(normal(0,1), class = Intercept),
+               prior(exponential(0.5), class = sd),
+               prior(exponential(0.5), class = sds),
+               prior(beta(0.5,0.5),class = rhocar),
+               prior(exponential(0.5),class = sdcar)
+)
+
+```
+
+#### Prior checks
+
+```{r}
+
+pp_bym <- update(fit_base, 
+                  formula = f_bym,
+                  prior = prior_bym,
+                  newdata = fitdata,
+                  data2 = list(W = W),
+                  sample_prior = "only") 
+```
+
+```{r}
+
+summary(pp_bym)
+plot(pp_bym)
+
+plot_pp_checks(pp_bym)
+
+```
+
+#### Fitting
+```{r}
+
+fit_bym <- update(fit_base, 
+                  formula = f_bym,
+                  prior = prior_bym,
+                  newdata = fitdata,
+                  data2 = list(W = W),
+                  recompile = T,
+                  control = list(adapt_delta = 0.97),
+                  file_refit = "on_change",
+                  file = "output/fit_bym.rds") 
+
+```
+
+#### Check fit
+```{r}
+summary(fit_bym)
+bayes_R2(fit_bym)
+```
+
+```{r}
+
+vars <- get_variables(fit_bym)
+mcmc_areas(fit_bym, 
+           pars = get_variables(fit_bym)[1:5])
+
+plot_pp_checks(fit_bym)
+plot(fit_bym)
+
+check_residuals(fit_bym, 
+                data = fitdata, 
+                shapefile = shape2)
+```
+
+```{r}
+
+fit_bym %>%
+  gather_draws(rcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> distinct() |> mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Total") -> summ_car
+
+summ_car |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", col = "Province",
+       subtitle = "Total CAR component") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+fit_bym %>%
+  gather_draws(nszcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> distinct() |> mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Non-spatial") -> summ_car_ns
+
+summ_car |> 
+  bind_rows(summ_car_ns) |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name,
+             alpha = component)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province", alpha = "Component",
+       subtitle = "Conditional auto-regressive (CAR) effect") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+```
+Lots of uncertainty in the non-spatial (IID) CAR component. 
+
+```{r}
+
+plot(conditional_smooths(fit_bym)) 
+
+fit_bym %>%
+  gather_draws(r_t[t, Intercept]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, t, month) |> distinct()) -> summ_r_t
+
+summ_r_t |>  
+  ggplot(aes(month, .value,
+             ymin = .lower, ymax = .upper)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "Month", y = "Posterior estimate", subtitle = "Temporal random effect")
+
+```
+### District:month interaction {.tabset}
+
+#### Formula and priors
+```{r}
+
+f_bym_int = bf(
+  n_npev | trials(n_npafp) ~ 
+    # Overall average prevalence
+    1 + 
+    # Random deviations by time/district
+    (1|t) +
+    (1|t:guid) +
+    # Correlated/uncorrelated random deviations by district 
+    car(W, gr = guid, type = "bym2") + 
+    # Seasonal temporal spline
+    s(month_of_year, bs = "cc", k = 12) 
+  )
+
+# Check default priors given this formula
+get_prior(f_bym_int, 
+          data = fitdata, data2 = list(W = W), 
+          family = binomial("logit"))
+
+prior_bym_int <- c(prior(normal(0,1), class = Intercept),
+               prior(exponential(0.5), class = sd),
+               prior(exponential(1), class = sd, coef = "t:guid"),
+               prior(exponential(0.5), class = sds),
+               prior(beta(0.5,0.5),class = rhocar),
+               prior(exponential(0.5),class = sdcar)
+)
+
+```
+
+#### Fitting
+```{r}
+
+fit_bym_int <- update(fit_bym, 
+                  formula = f_bym_int,
+                  prior = prior_bym_int,
+                  newdata = fitdata,
+                  data2 = list(W = W),
+                  recompile = T,
+                  file_refit = "on_change",
+                  file = "output/fit_bym_int.rds") 
+
+```
+
+#### Check fit
+```{r}
+summary(fit_bym_int)
+bayes_R2(fit_bym_int)
+```
+
+```{r}
+
+vars <- get_variables(fit_bym_int)
+mcmc_areas(fit_bym_int, 
+           pars = get_variables(fit_bym_int)[1:6])
+
+plot_pp_checks(fit_bym_int)
+plot(fit_bym_int)
+
+check_residuals(fit_bym_int, 
+                data = fitdata, 
+                shapefile = shape2)
+```
+
+```{r}
+
+fit_bym_int %>%
+  gather_draws(rcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> distinct() |> mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Total") -> summ_car
+
+summ_car |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", col = "Province",
+       subtitle = "Total CAR component") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+fit_bym_int %>%
+  gather_draws(nszcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> distinct() |> mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Non-spatial") -> summ_car_ns
+
+summ_car |> 
+  bind_rows(summ_car_ns) |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name,
+             alpha = component)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province", alpha = "Component",
+       subtitle = "Conditional auto-regressive (CAR) effect") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+fit_bym_int %>%
+  gather_draws(`r_t:guid`[t_guid,Intercept]) %>% 
+  median_qi() |> 
+  separate_wider_delim(t_guid, delim = "_",
+                       names = c("t","guid"),
+                       cols_remove = T) |>
+  mutate(t = as.numeric(t)) -> summ_t_guid
+
+summ_t_guid |> 
+  ggplot(aes(t, .value, ymin = .lower, ymax = .upper, group = guid)) + 
+  # geom_ribbon(alpha = 0.005) +
+  geom_line(alpha = 0.1) + 
+  labs(x = "Month", y = "Posterior estimate", 
+       subtitle = "Estimated random deviation per month and district")
+
+```
+
+```{r}
+
+plot(conditional_smooths(fit_bym_int)) 
+
+fit_bym_int %>%
+  gather_draws(r_t[t, Intercept]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, t, month) |> distinct()) -> summ_r_t
+
+summ_r_t |>  
+  ggplot(aes(month, .value,
+             ymin = .lower, ymax = .upper)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "Month", y = "Posterior estimate", subtitle = "Temporal random effect")
+
+```
+### Seasonal effect by province {.tabset}
+
+#### Formula and priors
+```{r}
+
+f_bym_prov = bf(
+  n_npev | trials(n_npafp) ~     
+    # Overall average prevalence
+    1 + 
+    # Random deviations by time
+    (1|t) + 
+    # Correlated/uncorrelated random deviations by district 
+    car(W, gr = guid, type = "bym2") + 
+    # Seasonal temporal splines by province
+    s(month_of_year, bs = "cc", k = 12, by = adm1_name) 
+  )
+
+# Check default priors given this formula
+get_prior(f_bym_prov, 
+          data = fitdata, data2 = list(W = W), 
+          family = binomial("logit"))
+
+prior_bym_prov <- c(prior(normal(0,1), class = Intercept),
+               prior(exponential(0.5), class = sd),
+               # Tighten prior on spline wiggliness since we're now fitting 7 different ones
+               prior(exponential(1), class = sds),
+               prior(beta(0.5,0.5),class = rhocar),
+               prior(exponential(0.5),class = sdcar)
+)
+```
+
+#### Prior checks
+
+```{r}
+
+pp_bym_prov <- brm(f_bym_prov, 
+               data = fitdata,
+               data2 = list(W = W),
+               family = "binomial",
+               prior = prior_bym,
+               sample_prior = "only") 
+
+```
+
+```{r}
+
+summary(pp_bym_prov)
+plot(pp_bym_prov, pages = 2)
+
+plot_pp_checks(pp_bym_prov)
+
+```
+
+#### Fitting
+```{r}
+
+fit_bym_prov <- update(fit_bym, 
+                  formula = f_bym_prov,
+                  prior = prior_bym_prov,
+                  newdata = fitdata,
+                  data2 = list(W = W),
+                  recompile = T,
+                  file = "output/fit_bym_prov.rds") 
+
+```
+
+#### Check fit
+```{r}
+summary(fit_bym_prov)
+bayes_R2(fit_bym_prov)
+```
+
+```{r}
+
+post_bym_prov <- as.matrix(fit_bym_prov)
+vars <- get_variables(fit_bym_prov)
+mcmc_areas(post_bym_prov, 
+           pars = vars[1:11])
+
+plot_pp_checks(fit_bym_prov)
+
+check_residuals(fit_bym_prov, 
+                data = fitdata, 
+                shapefile = shape2)
+```
+
+```{r}
+
+fit_bym_prov %>%
+  gather_draws(rcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> distinct() |> mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Total") -> summ_car
+
+summ_car |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", col = "Province",
+       subtitle = "Total CAR component") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+fit_bym %>%
+  gather_draws(nszcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> distinct() |> mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Non-spatial") -> summ_car_ns
+
+summ_car |> 
+  bind_rows(summ_car_ns) |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name,
+             alpha = component)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province", alpha = "Component",
+       subtitle = "Conditional auto-regressive (CAR) effect") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+```
+
+
+```{r}
+
+fit_bym_prov |> 
+    conditional_smooths() |>
+    plot(plot = F) -> plots
+  
+  ggplot_build(plots[[1]]) -> p1
+
+p1$plot$data |> 
+  rename(Province = adm1_name) |> 
+  ggplot(mapping = p1$plot$mapping) + 
+  geom_hline(yintercept = 0, lty = "dashed", col = "darkgrey") +
+  geom_ribbon(aes(fill = Province), alpha = 0.1) +
+  geom_line(aes(col = Province)) +
+  labs(x = NULL, y = "Provincial seasonal effect") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_discrete(limits = month.abb) 
+
+fit_bym_prov %>%
+  gather_draws(r_t[t, Intercept]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, t, month) |> distinct()) -> summ_r_t
+
+summ_r_t |>  
+  ggplot(aes(month, .value,
+             ymin = .lower, ymax = .upper)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "Month", y = "Posterior estimate", subtitle = "Temporal random effect")
+
+  
+```
+
+## Model Comparison
+
+```{r}
+
+lapply(list(fit_base, fit_bym, fit_bym_int, fit_bym_prov),
+       bayes_R2)
+loo::waic(fit_base, fit_bym, fit_bym_int, fit_bym_prov)
+# brms::loo(fit_base, fit_bym, fit_bym_int, fit_bym_prov)
+
+```
+
+# Final predictions
+
+Run final model with longer chains and save predictions:
+
+```{r}
+
+fit_final <- update(fit_bym_int,
+                    refresh=250,
+                    iter = 4000, chains = 4, 
+                    cores = parallel::detectCores(),
+                    control = list(adapt_delta = 0.97),
+                    save_pars = save_pars(all = T),
+                    file = "output/fit_final.rds") 
+
+```
+
+```{r}
+
+summary(fit_final)
+bayes_R2(fit_final)
+
+```
+
+```{r}
+
+vars <- get_variables(fit_final)
+mcmc_areas(fit_final, 
+           pars = get_variables(fit_final)[1:6])
+
+plot_pp_checks(fit_final)
+plot(fit_final)
+
+check_residuals(fit_final, 
+                data = fitdata, 
+                shapefile = shape2)
+
+```
+
+```{r}
+
+ppc_dens_overlay(y = fit_final$data$n_npev,
+                 yrep = predict(fit_final, draws = 50))
+
+```
+
+```{r}
+
+y <- predict(fit_final)
+
+fitdata |> 
+  bind_cols(y) |> 
+  mutate(pred_npev_p = Estimate/n_npafp, 
+         pred_npev_p_lo = `Q2.5`/n_npafp,
+         pred_npev_p_hi = `Q97.5`/n_npafp
+         ) -> pred_data
+  
+pred_data |> 
+  group_by(month) |> 
+  summarise(across(c(n_npafp, n_npev, Estimate, `Q2.5`,`Q97.5`),sum)) |> 
+  ungroup() |> 
+  mutate(across(n_npev:`Q97.5`,\(x) x/n_npafp)) |> 
+  ggplot(aes(month, Estimate)) +
+    geom_ribbon(aes(ymin = `Q2.5`, ymax = `Q97.5`), alpha = 0.5) +
+    geom_line() + 
+    geom_line(aes(y = n_npev), lty = "dashed", col = "red")
+  
+pred_data |> 
+  group_by(adm1_name, month) |> 
+  summarise(across(c(n_npafp, n_npev, Estimate, `Q2.5`,`Q97.5`),sum)) |> 
+  ungroup() |> 
+  mutate(across(n_npev:`Q97.5`,\(x) x/n_npafp)) |> 
+  ggplot(aes(month, Estimate, col = adm1_name, fill = adm1_name)) +
+    # geom_ribbon(aes(ymin = `Q2.5`, ymax = `Q97.5`), alpha = 0.5) +
+    geom_line() + 
+    geom_line(aes(y = n_npev), lty = "dashed") 
+  
+```
+
+Save data with predicted mean/SD per month/district:
+
+```{r}
+
+saveRDS(pred_data, "output/pred_prev_npev.rds")
+
+```

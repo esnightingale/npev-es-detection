@@ -22,7 +22,8 @@ plot_pp_checks <- function(fit){
   return(check_plots)
 }
 
-check_residuals <- function(fit, data, shapefile){
+check_residuals_t <- function(fit, data, 
+                              sptmp = F, shapefile = NULL){
   
   res <- residuals(fit) |> as.data.frame()
   data <- data |> 
@@ -30,12 +31,39 @@ check_residuals <- function(fit, data, shapefile){
            residual_err = res$Est.Error,
            residual_std = residual/residual_err)
   
-  # Check if residuals still show temporal autocorrelation
-  ggplot(data, aes(x = t, y = residual_std, group = guid)) +
-    geom_point(alpha = 0.2) +
-    geom_smooth(se = F, lwd = 0.1) +
-    labs(x = "Time", y = "Std. residuals (estimate/error)", title = "Temporal Autocorrelation in Residuals") -> p_time
+  if(sptmp == T){
+    ggplot(data, aes(x = t, y = residual_std, group = guid)) +
+      geom_point(alpha = 0.2) +
+      geom_smooth(se = F, lwd = 0.1) +
+      labs(x = "Time", y = "Std. residuals (estimate/error)", title = "Temporal trend in residuals") -> p_time
+    
+  }else{
+    ggplot(data, aes(x = t, y = residual_std)) +
+      geom_line() +
+      geom_smooth(se = T) +
+      labs(x = "Time", y = "Std. residuals (estimate/error)", title = "Temporal trend in residuals") -> p_time
+    
+  }
+
+  return(p_time)
   
+}
+  
+check_residuals <- function(fit, data, shapefile){
+    
+    res <- residuals(fit) |> as.data.frame()
+    data <- data |> 
+      mutate(residual = res$Estimate, 
+             residual_err = res$Est.Error,
+             residual_std = residual/residual_err)
+    
+    # Check if residuals still show temporal autocorrelation
+    ggplot(data, aes(x = t, y = residual_std, group = guid)) +
+      geom_point(alpha = 0.2) +
+      geom_smooth(se = F, lwd = 0.1) +
+      labs(x = "Time", y = "Std. residuals (estimate/error)", title = "Temporal Autocorrelation in Residuals") -> p_time
+    
+    
   # Check if residuals still show spatial autocorrelation
   data |> 
     group_by(guid) |> 
@@ -45,6 +73,12 @@ check_residuals <- function(fit, data, shapefile){
               resid_mean_err = mean(residual_err),
               resid_mean_std = mean(residual_std)) |> 
     right_join(shapefile) -> tmp
+  
+  # Check Moran's I of residuals
+  nb <- poly2nb(shapefile, queen=TRUE)
+  lw <- nb2listw(nb, style="W", zero.policy=TRUE)
+  MC<- moran.mc(tmp$resid_mean, lw, nsim=999, alternative="greater")
+  print(MC)
   
   tmp |> 
     ggplot(aes(geometry = SHAPE, fill = resid_std)) +

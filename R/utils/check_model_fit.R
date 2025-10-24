@@ -1,10 +1,4 @@
-check_model_fit <- function(fit){
-  
-  check_plots <- list(pp_check(fit, type = "bars"), 
-                      pp_check(fit, type = "scatter_avg"),
-                      pp_check(fit, "rootogram"))  
-  return(check_plots)
-}
+
 
 
 check_residuals <- function(fit, data, shapefile){

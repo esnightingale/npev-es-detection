@@ -1,0 +1,275 @@
+---
+title: 'Part 2: Site ES detection'
+subtitle: '2A: Descriptive'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
+theme_set(theme_minimal())
+
+dir <- "data/Pakistan"
+
+# ES data
+es <- readRDS(here(dir, "es_analysis.rds"))
+sites <- readRDS(here(dir, "sites_analysis.rds"))
+
+# Catchments
+catch_5k <- readRDS(here(dir , "catch_5k.rds"))
+catch_wsh <- readRDS(here(dir , "catch_wsh.rds"))
+
+# Shapefiles 
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+
+# Define a minimum site sample size for analysis 
+min_ss = 10
+
+es |> mutate(incl_site = site_total >= min_ss) -> es
+
+```
+
+# Descriptive
+
+## All sites
+
+```{r}
+
+n_distinct(es$site_id)
+
+es |> 
+  group_by(year, month) |> 
+  summarise(n_sites = n_distinct(site_id),
+            n_samples = n()) |> 
+  ungroup() |> 
+  ggplot(aes(month, n_sites)) +
+  geom_col() +
+  geom_line(aes(y = n_samples)) +
+  scale_y_continuous(name = "No. unique sites / collected samples") +
+  labs(x = NULL)
+
+es |> 
+  group_by(year, month) |> 
+  summarise(n_sites = n_distinct(site_id),
+            samp_per_site = n()/n_sites) |> 
+  ungroup() |> 
+  ggplot(aes(month, n_sites)) +
+  geom_col() +
+  geom_line(aes(y = samp_per_site*100)) +
+  scale_y_continuous(name = "No. unique sites",
+                     sec.axis = sec_axis(trans=~./100, 
+                                         name = "Monthly samples per site")) +
+  labs(x = NULL) -> p_collect
+
+p_collect
+
+```
+
+### Samples per site
+
+```{r}
+
+sites |> 
+  group_by(total_collections) |> 
+  count() |> 
+  ungroup() |> slice_max(n, n = 5) |> pull(total_collections) -> max_n
+
+ggplot(sites, aes(total_collections)) + 
+  geom_histogram() + 
+  # geom_vline(xintercept = max_n-0.5) + 
+  # scale_x_continuous(trans = "log2") +
+  labs(x = "Total sample collections, 2021-24", 
+       y = "No. sites")
+
+es |> 
+  group_by(site_id, year) |> 
+  count() |> 
+  ungroup() |> 
+  ggplot(aes(n, fill = as.factor(year))) + 
+  geom_density(alpha = 0.5)
+
+```
+
+Coverage by samples per site:
+```{r}
+
+npev_dist |> 
+  filter(period == 2021) |> 
+  # ggplot(aes(fill = npev_npafp_p)) + 
+  ggplot(fill = NULL) +
+  geom_sf() + 
+  geom_sf(data = sites |> arrange(total_collections), inherit.aes = F, shape = 23,
+          aes(fill = factor(total_collections>=10,
+                            labels = c("< 10",">=10")))) +
+  # scale_fill_viridis_b("Total collections") +
+  theme(axis.text = element_blank(), 
+        legend.position = c(0.8,0.2),
+        legend.box.background = element_rect(fill = "white")) +
+  labs(fill = "Total no. samples",
+       title = "Environmental surveillance coverage in Pakistan",
+       subtitle = "All sampled sites")
+
+npev_dist |> 
+  filter(period == 2021) |> 
+  ggplot(fill = NULL) +
+  geom_sf() + 
+  geom_sf(data = sites |> filter(site_id %in% included_sites), inherit.aes = F, aes(shape = "Site"), fill = "white") +
+  scale_shape_manual(values = 23) + 
+  theme(axis.text = element_blank(), 
+        legend.position = c(0.8,0.2),
+        legend.box.background = element_rect(fill = "white")) +
+  labs(shape = NULL, 
+       title = "Environmental surveillance coverage in Pakistan",
+       subtitle = paste0("Sites with at least ",min_ss," sample(s), 2021-2024"))
+
+```
+### PV positivity
+
+- PV+ samples will be excluded from analysis due to masking of NPEV.
+
+Distribution of PV+ samples over time:
+```{r}
+
+tabyl(es$pv)
+
+es |> 
+  group_by(month) |> 
+  summarise(npv = sum(!pv),
+            pv = sum(pv)) |> 
+  pivot_longer(npv:pv) |> 
+  mutate(name = factor(name, labels = c("Non-polio","Polio"))) |> 
+  ggplot(aes(month, value, fill = name)) +
+  geom_col(position = position_dodge()) +
+  scale_fill_manual(values = c("grey", "black")) +
+  scale_y_continuous(trans = "sqrt") +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = "Month", y = "No. samples", fill = NULL) -> p_pvpos
+p_pvpos
+
+```
+-> increasing since mid-2023. 
+-> Reduced sample size in recent years - will this be a problem?
+
+```{r}
+
+p_collect + p_pvpos +
+  plot_annotation(tag_levels = "A")
+ggsave(here("figures/descriptive/es/es_time.png"),
+       height = 4, width = 10, bg = "white")
+
+```
+
+## Included sites
+
+Summarise site level prevalence for those that meet minimum sample size:
+```{r}
+
+es <- filter(es, incl_site)
+
+es |> 
+  mutate(npev = npev_f == "NPEV+") |> 
+  tbl_summary(include = c(pv, npev),
+              by = year,
+              label = list(pv = "Poliovirus positives",
+                           npev = "NPEV positives")) |> 
+  add_overall() |> 
+  as_gt()
+
+es |> 
+  group_by(year, month, site_id) |> 
+  summarise(n_samp = n(),
+            n_npev = sum(npev_f=="NPEV+"),
+            p_npev = n_npev/n_samp) |> 
+  ungroup() |> 
+  tbl_summary(include = c(n_samp, n_npev, p_npev),
+              by = year,
+              label = list(n_samp = "Collected samples", 
+                           n_npev = "NPEV positives", 
+                           p_npev = "Crude NPEV prevalence")) |> 
+  add_overall() |> 
+  as_gt()
+
+es |> 
+  group_by(year, site_id) |> 
+  summarise(n_samp = n(),
+            n_pv = sum(pv),
+            n_npev = sum(npev_f=="NPEV+"),
+            p_npev = n_npev/n_samp) |> 
+  ungroup() |> 
+  tbl_summary(include = c(n_samp, n_pv, n_npev, p_npev),
+              by = year,
+              label = list(n_samp = "Collected samples", 
+                           n_pv = "Poliovirus positives", 
+                           n_npev = "NPEV positives", 
+                           p_npev = "Crude NPEV prevalence")) |> 
+  add_overall() |> 
+  as_gt()
+
+es |> 
+  group_by(site_id) |> 
+  summarise(n_samp = n(),
+            n_pv = sum(pv),
+            n_npev = sum(npev_f=="NPEV+"),
+            p_npev = n_npev/n_samp) |> 
+  ungroup() |> 
+  tbl_summary(include = c(n_samp, n_pv, n_npev, p_npev),
+              label = list(n_samp = "Collected samples", 
+                           n_pv = "Poliovirus positives", 
+                           n_npev = "NPEV positives", 
+                           p_npev = "Crude NPEV prevalence")) |> 
+  as_gt()
+
+```
+
+### Seasonality 
+
+```{r}
+
+# Samples by month of year
+es |> 
+  group_by(month_of_year) |> 
+  summarise(n = n(),
+            npev = sum(!is.na(npev)),
+            p_npev = npev*100/n) |> 
+  ungroup() -> es_moy
+
+ggplot() + 
+  geom_bar(data = es, 
+           aes(month_of_year, fill = npev_f)) + 
+  geom_line(data = es_moy, 
+            aes(x = month_of_year, y = p_npev*6,
+                group = 1)) +
+  scale_y_continuous(name = "Collected samples", 
+                     sec.axis = sec_axis(trans=~./6, 
+                                         name = NULL)) +
+  scale_fill_manual(values = c("grey","indianred")) +
+  theme(legend.position = c(0.1,0.9)) +
+  labs(x = "Collection month", fill = NULL) -> p_moy
+
+es |> 
+  group_by(year, month_of_year) |> 
+  summarise(n = n(),
+            npev = sum(!is.na(npev)),
+            p_npev = npev*100/n) |> 
+  ungroup() |>
+  ggplot(aes(month_of_year, p_npev, 
+             col = as.factor(year),
+             group = as.factor(year))) + 
+  geom_point() +
+  geom_smooth(se = F) +
+  scale_colour_viridis_d(option = "mako", end = 0.8) +
+  ylim(0,100) +
+  theme(legend.position = c(0.1,0.9)) +
+  labs(x = "Collection month", y = "% Positive", col = NULL) -> p_moy_yr
+```
+
+```{r}
+
+p_moy + p_moy_yr + 
+  plot_annotation(tag_levels = "A")
+
+ggsave(here("figures/descriptive/es/npev_time.png"),
+       height = 4, width = 10, bg = "white")
+```

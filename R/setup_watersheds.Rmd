@@ -1,0 +1,144 @@
+---
+title: "Novel-T modelled watersheds"
+output: html_notebook
+---
+
+## Objective
+
+Import and combine modelled watersheds from Novel-T platform for ES sites in Pakistan. 
+
+## Unzip and read shapefiles
+```{r}
+
+pacman::p_load(tidyverse, sf, here, utils, janitor, mapview)
+
+dir <- here("data","Pakistan")
+
+# District shapefiles
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+
+# Site locations (re-downloaded from Novel-T after uploading to process catchments?)
+nt_sites <- st_read(here(dir,"Novel-T/for processing","es_sites_pak.shp"))
+
+# List sub-folders for catchments
+dirs <- list.dirs(path = here(dir,"Novel-T/processed"), recursive = F)
+
+# Function to unzip sub-folders
+unzip_files <- function(dir, name){
+  unzip(here(dir,paste0(name,".zip")), 
+        exdir = here(dir,name))
+}
+
+# Unzip all sub-folders
+lapply(c("adjacent_catchments","delineated_catchments","drainage_lines","manual_sites","osm_rivers","osm_lakes"),
+              \(name) lapply(dirs, unzip_files, name)) 
+
+```
+
+Read all delineated catchments shapefiles into a single sf object.
+```{r}
+
+read_catchments <- function(dir,type){
+  name = paste0(type,"_catchments")
+  dsn = here(dir,name)
+  print(dsn)
+  st_read(dsn = dsn,
+          layer = name, quiet = T) %>% 
+    mutate(catchment_type = type)
+}
+
+watershed <- lapply(c("adjacent","delineated"),
+                     \(name) lapply(dirs, read_catchments, name)) |> 
+  bind_rows() |> 
+  st_make_valid()
+
+st_crs(watershed)
+
+```
+
+Also read in site locations:
+```{r}
+
+read_sites <- function(dir){
+  dsn = here(dir,"manual_sites")
+  print(dsn)
+  st_read(dsn = dsn,
+          layer = "manual_sites", quiet = T) 
+}
+
+sites <- lapply(dirs, read_sites) |> 
+  bind_rows() |> 
+  st_make_valid()
+
+st_crs(sites)
+
+```
+
+I think these are sites already catalogued in the system, not the ones I uploaded? However they are described as "manual"...
+
+Check link between watershed and sites:
+```{r}
+
+sum(!is.na(watershed$site))
+
+```
+
+## Explore
+
+### Mapview
+
+```{r}
+
+mapview(filter(watershed, !is.na(site)), col.regions = "blue") +
+  mapview(sites, col.regions = "blue") + 
+  mapview(nt_sites, col.regions = "yellow")
+
+```
+
+"Manual sites" extracted from Novel-T after processing watersheds are a subset of the uploaded set of unique sites from the ES data. Supposedly 466 sites from the platform but here only 461 watersheds with non-missing site ID and 178 sites in "manual_sites" shapefiles. 
+
+### Plot over shapefiles
+```{r}
+
+# ggplot() + 
+#   geom_sf(data = shape2, fill = NA, color = "black") +
+#   geom_sf(data = watershed |> filter(catchment_type == "delineated"), 
+#           aes(fill = catchment_type), alpha = 0.5) +
+#   geom_sf(data = watershed |> filter(catchment_type == "adjacent"), 
+#           aes(fill = catchment_type), alpha = 0.5) +
+#   scale_fill_manual(values = c("delineated" = "blue", "adjacent" = "red")) +
+#   theme_minimal() +
+#   labs(title = "Novel-T modelled watersheds",
+#        subtitle = "Pakistan")
+
+```
+
+~18k unique watersheds - seems like the "adjacent" and "delineated" labels might refer to areas of the catchment contained in the same district or in an adjacent district?
+
+Intersect district shapefiles with watersheds:
+
+```{r}
+
+# shape_wsh <- st_intersection(shape2, watershed)
+# 
+# shape_sub <- filter(shape2, adm1_name == "")
+# ggplot() + 
+#   geom_sf(data = filter(), fill = NA, color = "black") +
+#   geom_sf(data = watershed |> filter(catchment_type == "delineated"), 
+#           aes(fill = catchment_type), alpha = 0.5) +
+#   geom_sf(data = watershed |> filter(catchment_type == "adjacent"), 
+#           aes(fill = catchment_type), alpha = 0.5) +
+#   scale_fill_manual(values = c("delineated" = "blue", "adjacent" = "red")) +
+#   theme_minimal() +
+#   labs(title = "Novel-T modelled watersheds",
+#        subtitle = "Pakistan")
+
+```
+
+## Save catchments as RDS
+
+```{r}
+
+saveRDS(watershed, here(dir,"analysis","watershed.rds"))
+
+```

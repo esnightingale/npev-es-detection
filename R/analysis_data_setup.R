@@ -84,7 +84,7 @@ rownames(W) <- shape2$guid # Set rownames to district names
 
 afp <- afp_ |> 
   # Distinguish polio and non-polio cases
-  mutate(npafp = !(grepl("WPV", virus_type_s) | grepl("VDPV",virus_type_s))) |> 
+  mutate(npafp = !(grepl("WILD", virus_type_s) | grepl("VDPV",virus_type_s))) |> 
   # exclude AFP among over-15s 
   filter(age_m < 15*12) |>
   # Aggregate to district and month

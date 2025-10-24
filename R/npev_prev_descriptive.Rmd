@@ -1,0 +1,191 @@
+---
+title: 'Part 1: District NPEV prevalence'
+subtitle: 'Descriptive summary'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+library(devtools)
+if(!require(cmdstanr)){
+  devtools::install_github("stan-dev/cmdstanr", dependencies=c("Depends", "Imports"))
+}
+if(!require(INLA)){
+install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
+theme_set(theme_minimal())
+
+dir <- "data/Pakistan"
+
+# NP-AFP analysis data
+data <- readRDS(here(dir, "afp_analysis.rds"))
+
+# Shapefiles and adjacency matrix
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+W <- readRDS(here(dir,"W.rds"))
+
+```
+
+## Table 1
+
+```{r}
+
+data |> 
+  tbl_summary(include = c(n_afp, n_npafp, npafp_r, n_npev, npev_npafp_p),
+              by = year,
+              label = list(n_afp = "AFP notifications", 
+                           n_npafp = "Non-polio AFP notifications", 
+                           npafp_r = "Non-polio AFP rate (per 100,000 U15s)", 
+                           n_npev = "NPEV positives", 
+                           npev_npafp_p = "Crude NPEV prevalence")) |> 
+  add_overall() |> 
+  as_gt()
+
+```
+
+Plot crude NPEV prevalence among notified non-polio AFP cases, per district and over time:
+
+```{r}
+
+# Overall AFP/NPAFP rates
+data |> 
+  group_by(month) |> 
+  summarise(across(c("n_afp","n_npafp", "denominator"), sum)) |> 
+  pivot_longer(n_afp:n_npafp) |> 
+  mutate(name = factor(name, labels = c("AFP","NP-AFP")),
+         r = value*1e5/denominator) |> 
+  rowwise() |> 
+  mutate(lo = Hmisc::binconf(value, denominator)[2]*1e5,
+         hi = Hmisc::binconf(value, denominator)[3]*1e5) |>
+  ggplot(aes(month, r, ymin = lo, ymax = hi)) +
+  geom_ribbon(alpha = 0.2) +
+  geom_line(aes(lty = name, col = name)) + 
+  guides(color = guide_legend(NULL),
+         lty = guide_legend(NULL)) +
+  scale_colour_manual(values = c("black","red")) +
+  scale_linetype_manual(values = c("solid","dashed")) + 
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = "Month", y = "Rate per 100,000") -> p_afp_rates
+
+# Proportion PV+
+data |> 
+  group_by(month) |> 
+  summarise(afp = sum(n_afp),
+            npafp = sum(n_npafp),
+            pv = afp - npafp) |> 
+  pivot_longer(npafp:pv) |> 
+  mutate(name = factor(name, labels = c("Non-polio","Polio"))) |> 
+  ggplot(aes(month, value, fill = name)) +
+  geom_col(position = position_dodge()) +
+  scale_fill_manual(values = c("grey", "black")) +
+  scale_y_continuous(trans = "sqrt") +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = "Month", y = "No. AFP notifications", fill = NULL) -> p_pvpos
+
+# Annual NPEV+ rate by district
+data |> 
+  group_by(guid, year) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  right_join(shape2) |> 
+  ggplot(aes(fill = r_npev, geometry = SHAPE)) + 
+  geom_sf(col = NA) +
+  facet_wrap(~year) +
+  scale_fill_viridis_c(name = "NPEV+\nPrevalence", trans = "sqrt") + 
+  theme_void() -> p_obs_dist_yr
+
+# Seasonal trend, by year
+data |> 
+  group_by(month_of_year, year) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev*100/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = factor(year), col = factor(year), fill = factor(year))) + 
+  geom_point() + 
+  geom_smooth(se = F) + 
+  scale_colour_viridis_d(option = "mako", end = 0.8) +
+  scale_fill_viridis_d(option = "mako", end = 0.8) +
+  theme(legend.position = c(0.1,0.9)) +
+  # guides(fill = "none") +
+  ylim(0,100) +
+  labs(x = "Paralysis onset month", y = "% Positive", col = "Year", fill = "Year") -> p_obs_mth_yr
+
+# Seasonal trend, by province
+data |> 
+  group_by(month_of_year, adm1_name) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = adm1_name, col = adm1_name, fill = adm1_name)) + 
+  # geom_jitter(alpha = 0.2) + 
+  geom_smooth(alpha = 0.5) + 
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_prov
+
+# Seasonal trend, by district
+data |> 
+  group_by(month_of_year, guid) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month_of_year, y = r_npev, 
+             group = guid)) + 
+  # geom_jitter(alpha = 0.2) + 
+  geom_smooth(alpha = 0.1, lwd = 0.2, se = F, 
+              col = "steelblue") + 
+  theme(axis.text.x = element_text(angle = 45)) +
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_dist
+
+# Correlation with population density
+data |> 
+  group_by(guid_pop_dens, guid) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = as.numeric(guid_pop_dens), y = r_npev)) + 
+  geom_jitter(alpha = 0.2) +
+  geom_smooth(alpha = 0.1, lwd = 0.2, se = T) + 
+  scale_x_continuous(trans = "log10") +
+  labs(x = "Log population density (/km2)", y = "NPEV+ Prevalence") -> p_obs_dens_dist
+
+p_afp_rates
+p_pvpos
+
+p_obs_mth_yr
+p_obs_dist_yr
+p_obs_mth_prov
+p_obs_mth_dist
+p_obs_dens_dist
+
+```
+
+Overall decrease year on year, with more pronounced seasonality in 2021. 
+
+## Figure 1
+
+```{r}
+
+p_obs_mth_yr
+ggsave("./figures/descriptive/afp/npev_season_yr.png", 
+       bg = "white",
+       height = 4, width = 5, units = "in")
+
+(p_afp_rates + p_pvpos)/
+  (p_obs_dist_yr + p_obs_mth_dist) +
+  plot_annotation(tag_levels = "A")
+ggsave("./figures/descriptive/afp/Figure_1.png", 
+       bg = "white",
+       height = 6, width = 8, units = "in")
+
+```

@@ -1,0 +1,229 @@
+################################################################################
+# Fit and compare model structures for areal NPEV prevalence among NPAFP cases 
+# - In particular explore specification of RW temporal structure as in:
+#   https://discourse.mc-stan.org/t/random-walk-or-autoregressive-prior-in-brms/28411/11 
+################################################################################
+
+# Env setup -----------------------------------------------------------
+pacman::p_load(tidyverse, here, cmdstanr, brms, gtsummary, units, loo)
+theme_set(theme_minimal())
+
+dir <- "data/Pakistan"
+
+# Load data ------------------------------------------------------------------
+
+# NP-AFP analysis data
+data <- readRDS(here(dir, "afp_analysis.rds"))
+
+# Set up additional variables
+fitdata_t <- data |> 
+  group_by(t, month_of_year, year) |>
+  summarise(n_npev = sum(n_npev),
+            n_npafp = sum(n_npafp)) |>
+  ungroup() |> 
+  mutate(month_of_year = as.numeric(month_of_year),
+                  year_F = factor(year),
+                  t_F = factor(t, levels = 1:max(data$t))) 
+
+
+# Descriptive -------------------------------------------------------------
+
+fitdata_t |> 
+  ggplot(aes(x = t, y = n_npev/n_npafp)) +
+  geom_point(cex = 0.5) + 
+  geom_smooth(aes(col = year_F)) + 
+  geom_smooth() +
+  labs(x = "Time", y = "Prevalence", title = "NPEV prevalence among NPAFP cases",
+       subtitle = "National level", col = NULL) 
+
+# Examine autocorrelation
+library(forecast)
+Acf(fitdata_t$n_npev/fitdata_t$n_npafp, lag.max = 48, plot = TRUE) 
+Pacf(fitdata_t$n_npev/fitdata_t$n_npafp, lag.max = 48,plot = TRUE) 
+
+ts_prev <- ts(fitdata_t$n_npev/fitdata_t$n_npafp, frequency = 12)
+plot(ts_prev)
+plot(decompose(ts_prev))
+
+ts_prev |> diff(lag = 12) |> ggtsdisplay()
+ts_prev |> diff(lag = 12) |> diff() |> ggtsdisplay()
+
+# Check order
+fit_arima <- auto.arima(ts_prev, seasonal = TRUE)
+arimaorder(fit_arima)
+# p         d         q         P         D         Q Frequency 
+# 1         0         0         1         1         0        12 
+
+autoplot(residuals(fit_arima))
+Box.test(residuals(fit_arima), type = "Ljung-Box")
+
+# => First order non-seasonal and seasonal AR
+
+
+# Base model --------------------------------------------------------------
+# Simple spline on time
+
+# Formula
+f1 <- bf(n_npev | trials(n_npafp) ~ s(t))
+
+# Fit model
+fit1 <- brm(f1, 
+            family = "binomial",
+            data = fitdata_t, 
+            iter = 4000, chains = 4, cores = 4, seed = 2)
+
+plot_pp_checks(fit1)
+
+summary(fit1)
+plot(fit1)
+plot(conditional_smooths(fit1))
+bayes_R2(fit1)
+
+check_residuals_t(fit1, fitdata_t)
+
+
+# Add seasonal spline -----------------------------------------------------
+
+# Formula
+f2 <- bf(n_npev | trials(n_npafp) ~ s(t) + 
+           s(month_of_year, bs = "cc", k = 12))
+
+# Fit model
+fit2 <- brm(f2, 
+            family = "binomial",
+            data = fitdata_t, 
+            iter = 4000, chains = 4, cores = 4, seed = 2)
+
+pp_check(fit2, type = "bars")
+
+summary(fit2)
+plot(fit2)
+plot(conditional_smooths(fit2))
+bayes_R2(fit2)
+
+check_residuals_t(fit2, fitdata_t)
+
+# AR1 model --------------------------------------------------------------
+
+# Formula
+f3 <- bf(n_npev | trials(n_npafp) ~ ar(t , p = 1) +
+           s(month_of_year, bs = "cc", k = 12))
+
+# Fit model
+fit3 <- brm(f3, 
+           family = "binomial",
+           data = fitdata_t, 
+           iter = 4000, chains = 4, cores = 4, seed = 2)
+
+summary(fit3)
+plot(fit3)
+bayes_R2(fit3)
+
+check_residuals_t(fit3, fitdata_t)
+
+# Random walk model -------------------------------------------------------
+
+prior_rw <- function(idx_inter = 1, 
+                     sigma_inter, 
+                     prior_scale_sigma_rw,...
+) {
+  
+  pr <- prior_string(paste0("rw1(", idx_inter, ", ", sigma_inter, ", sigma_rw)"), ...) +
+    prior_string(paste0("target += normal_lpdf(sigma_rw| 0, ", prior_scale_sigma_rw, ")"), check=FALSE)
+  
+  sv_rw1 <- stanvar(scode = "real rw1_lpdf(vector alpha, int idx_inter, real sigma_inter, real sigma_rw) {
+    int N = num_elements(alpha);
+    return normal_lpdf(alpha[2:N] - alpha[1:N - 1] | 0, sigma_rw) + normal_lpdf(alpha[idx_inter]| 0, sigma_inter);
+  }", 
+                    block = "functions")
+  
+  sv_sigma_rw <- stanvar(scode="real<lower=0> sigma_rw;", 
+                         block="parameters")
+  
+  list(prior=pr, stanvar=sv_rw1 + sv_sigma_rw)
+}
+
+# Formula
+f4 = bf(
+  n_npev | trials(n_npafp) ~ lin + rw,
+  lin ~ 0,
+  rw ~ 1 + t_F, nl=TRUE, center=FALSE)
+
+# Check default priors given this formula
+get_prior(f4, fitdata_t, family = binomial("logit"))
+
+# Define the RW prior
+rw_prior <- prior_rw(1, 5, 0.5, class="b", nlpar="rw") 
+
+# Fit model
+fit4 <- brm(f4, 
+           family = "binomial",
+           data = fitdata_t, 
+           prior = rw_prior$prior,
+           stanvars = rw_prior$stanvar, 
+           iter = 4000, chains = 4, cores = 4, seed = 2)
+
+summary(fit4)
+plot(fit4)
+bayes_R2(fit4)
+
+check_residuals_t(fit4, fitdata_t)
+
+# Add seasonality ---------------------------------------------------------
+# Seasonal spline on month of year + RW
+
+# Formula
+f5 <- bf(n_npev | trials(n_npafp) ~ lin + rw,
+         lin ~ s(month_of_year, bs = "cc", k = 12),
+         rw ~ 1 + t_F, nl=TRUE, center=FALSE)
+
+# Fit model
+fit5 <- brm(f5, 
+            family = "binomial",
+            data = fitdata_t, 
+            iter = 4000, chains = 4, cores = 4, seed = 2)
+
+summary(fit5)
+plot(fit5)
+plot(conditional_smooths(fit5))
+bayes_R2(fit5)
+
+check_residuals_t(fit5, fitdata_t)
+
+# Explore hierarchical time series ------------------------------------------------
+
+library(hts)
+
+fitdata_st <- fitdata |> 
+  mutate(adm1 = str_sub(adm1_name, 1, 3)) |>
+  group_by(adm1) |> 
+  mutate(id = paste0(adm1, str_pad(as.numeric(as.factor(guid)), 2))) |> 
+  group_by(id, t, month_of_year, year) |>
+  summarise(n_npev = sum(n_npev),
+            n_npafp = sum(n_npafp)) |>
+  ungroup() |> 
+  mutate(month_of_year = as.numeric(month_of_year),
+         year_F = factor(year),
+         t_F = factor(t, levels = 1:max(data$t)),
+         prev = case_when(n_npafp == 0 ~ 0,
+                          n_npafp > 0 ~ n_npev/n_npafp)) 
+  
+fitdata_st |> 
+  pivot_wider(id_cols = t_F, names_from = id, values_from = prev) |> 
+  column_to_rownames("t_F") -> fitdata_st_w
+
+hts_prev <- hts(fitdata_st_w, characters = c(3,2))
+
+hts_prev %>% aggts(levels=0:1) %>%
+  autoplot(facet=TRUE) 
+
+as_tibble(fitdata_st_w) %>%
+  gather(id) %>%
+  mutate(Date = rep(row.names(fitdata_st_w), NCOL(fitdata_st_w)),
+         Province = str_sub(id,1,3)) %>%
+  ggplot(aes(x=Date, y=value, group=id, colour=id)) +
+  geom_line() +
+  facet_grid(Province~.) +
+  xlab("Month") + ylab("Prevalence") +
+  ggtitle("NPEV prevalence by month")+
+  guides(col = "none")

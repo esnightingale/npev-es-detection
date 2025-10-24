@@ -1,0 +1,1329 @@
+---
+title: "Part 2: ES site sensitivity model"
+output: html_notebook
+    df_print: paged
+---
+
+# Objective
+
+To estimate the probability of NPEV detection at each ES site, relative to previously estimated district-level prevalence (mean and SD per district-month).
+
+# Model specification
+
+Binary detection of NPEV in sample $j$ from site $s$ at time $t$:
+
+$$ Y_{j,s,t} \sim  Bernoulli(q_{j,s,t}) $$
+
+where $q_{j,s,t}$ is the probability of detecting NPEV, given district prevalence $p_{i,t}$.
+
+$$ logit(q_{j,s,t}) = \gamma_0 + \gamma_s*log(p_{i,t}) + f_{s,t}(month(t)) $$
+The relation $i~j$ will be defined according to three options: 
+- Site $j$ point location is within district $i$
+- Majority watershed of site $j$ intersects with district $i$
+- Any watershed of site $j$ intersects with district $i$ where $i \in I$, using a weighted average of $p_{i,t}$ over all $i \in I$. [Question: How to average SE?]
+
+```{r}
+
+pacman::p_load(tidyverse, lubridate, here, janitor, gtsummary, sf, spdep, 
+               rstan, brms, tidybayes, bayesplot, units, loo, patchwork)
+theme_set(theme_minimal())
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir <- "data/Pakistan"
+
+# source("./utils/fit_npafp_model.R")
+source("./utils/check_model_fit.R")
+
+# NP-AFP analysis data with predicted NPEV prevalence (BYM2 + IID(time*guid) + season)
+npev_prev <- readRDS("output/pred_prev_npev.rds") 
+
+# ES data
+es <- readRDS(here(dir, "es_analysis.rds"))
+
+# Shapefiles 
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+
+# Set colour palette for provinces
+pal_prov <- viridis::turbo(n_distinct(npev_prev$adm1_name))  
+names(pal_prov) <- unique(npev_prev$adm1_name)
+
+```
+
+# Data setup
+
+Need dataset of samples per month and site -> grouped binomial of NPEV+ out of total samples.
+
+ * Site GPS coordinates
+ * Site type (WWTP vs other)
+ * Wet/dry season
+ * % urban within radius?
+ * % surface water within radius?
+
+First join district shapes to NPEV prevalence data:
+
+```{r}
+
+npev_dist <- shape2 |> 
+  select(guid) |> 
+  full_join(npev_prev)
+
+# Test plots
+npev_dist |> 
+  filter(period == 2021) |> 
+  ggplot(aes(fill = npev_npafp_p)) + 
+  geom_sf() + 
+  scale_fill_viridis_c("Observed\nNPEV prevalence") + 
+  labs(alpha = "No. NP-AFP")
+npev_dist |> 
+  filter(period == 2021) |> 
+  ggplot(aes(fill = npev_npafp_p, alpha = n_npafp_obs)) + 
+  geom_sf() + 
+  scale_fill_viridis_c("Observed\nNPEV prevalence") + 
+  labs(alpha = "No. NP-AFP")
+npev_dist |> 
+  filter(period == 2021) |> 
+  ggplot(aes(fill = pred_mean)) + 
+  geom_sf() + 
+  scale_fill_viridis_c("Predicted\nNPEV prevalence", limits = c(0,0.5))
+
+```
+Aggregate samples to month and define time variables for samples to match prevalence predictions, and define a minimum number of samples to exclude low power sites:
+
+```{r}
+
+min_ss <- 10
+
+es |> 
+  rename(coord_x = x, 
+         coord_y = y) |> 
+  # Define month and year of collection
+  mutate(month = floor_date(collection_date, "month"),
+         month_of_year = month(collection_date, label = T),
+         year = year(month),
+         # Flag any samples in which poliovirus was detected to later remove
+         pv = grepl("WILD",virus_type_s) | grepl("PV", virus_type_s),
+         # Define factor for NPEV positivity
+         npev_f = case_when(is.na(npev) ~ "NPEV-",
+                            !is.na(npev) ~ "NPEV+"),
+         # Categorise by catchment size
+         catchment_cat_5k = factor(catchment_pop_5k > 1e5, 
+                                   labels = c("<100,000", ">100,000"))) |> 
+  # Filter to sites with at least X samples
+  group_by(site_id) |> 
+  mutate(site_total = n()) |> 
+  ungroup() |> 
+  mutate(incl_site = site_total >= min_ss) -> es
+
+included_sites <- unique(es$site_id[es$incl_site])
+
+```
+
+## Joins
+
+Join ES data to predicted district-level NPEV prevalence, by multiple approaches. 
+
+### 1. By site location
+
+ES samples already linked to guid of district in which coordinates fall:
+
+```{r}
+
+tabyl(es$guid) |> 
+  head()
+
+# Join by this existing guid
+es_npev1 <- es |> 
+   left_join(npev_prev |> select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
+   select(guid, guid_pop_dens, site_id:coord_imp, catchment_pop_5k, catchment_cat_5k, 
+          year, month, month_of_year, 
+          pred_mean, pred_sd, everything()) -> es_npev1
+
+summary(es_npev1$pred_mean)
+
+```
+
+Seems some of the existing guids don't appear in predicted data? Re-do this link:
+
+```{r}
+
+sites <- es |> 
+  group_by(site_id, coord_x, coord_y) |> 
+  summarise(first_collection = min(collection_date),
+            first_collection_y = year(first_collection),
+            total_collections = n(),
+            p_wpv = mean(final_class == "WPV1"),
+            p_npev = mean(!is.na(npev))) |> 
+  st_as_sf(coords = c("coord_x","coord_y"), crs = 4326) 
+
+sites_dist <- st_join(sites, select(shape2, guid), st_within) |> 
+  st_drop_geometry()
+
+```
+
+Then link all ES samples to NPEV prevalence by district of site location and time period:
+
+```{r}
+
+es |> 
+  # Drop existing guid
+  select(-guid) |> 
+  left_join(sites_dist, by = "site_id") |> 
+  left_join(npev_prev |> select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
+  select(guid, guid_pop_dens, site_id:coord_imp, catchment_pop_5k, catchment_cat_5k, year, month, pred_mean, pred_sd, everything()) -> es_npev1
+
+summary(es_npev1$pred_mean)
+
+```
+
+Missing values corrected.
+
+Map out ES coverage: 
+```{r}
+
+npev_dist |> 
+  filter(period == 2021) |> 
+  # ggplot(aes(fill = npev_npafp_p)) + 
+  ggplot(fill = NULL) +
+  geom_sf() + 
+  geom_sf(data = sites |> arrange(total_collections), inherit.aes = F, shape = 23,
+          aes(fill = factor(total_collections>=10,
+                            labels = c("< 10",">=10")))) +
+  # scale_fill_viridis_b("Total collections") +
+  theme(axis.text = element_blank(), 
+        legend.position = c(0.8,0.2),
+        legend.box.background = element_rect(fill = "white")) +
+  labs(fill = "Total no. samples",
+       title = "Environmental surveillance coverage in Pakistan",
+       subtitle = "All sampled sites")
+
+npev_dist |> 
+  filter(period == 2021) |> 
+  ggplot(fill = NULL) +
+  geom_sf() + 
+  geom_sf(data = sites |> filter(site_id %in% included_sites), inherit.aes = F, aes(shape = "Site"), fill = "white") +
+  scale_shape_manual(values = 23) + 
+  theme(axis.text = element_blank(), 
+        legend.position = c(0.8,0.2),
+        legend.box.background = element_rect(fill = "white")) +
+  labs(shape = NULL, 
+       title = "Environmental surveillance coverage in Pakistan",
+       subtitle = paste0("Sites with at least ",min_ss," sample(s), 2021-2024"))
+
+```
+
+### 2. By 5km radius
+
+First define buffer around unique sites and intersect with districts:
+
+```{r}
+
+sites_buff <- es |> 
+  select(site_id, coord_x, coord_y) |> 
+  distinct() |> 
+  st_as_sf(coords = c("coord_x","coord_y"), crs = 4326) |> 
+  st_buffer(dist = set_units(5,"km"))
+
+sites_buff_dist <- st_intersection(sites_buff, select(shape2, guid))
+
+```
+
+Select one row for each site with maximum area:
+
+```{r}
+
+sites_buff_dist_max <- sites_buff_dist |> 
+  mutate(area = st_area(sites_buff_dist)) |> 
+  st_drop_geometry() |> 
+  group_by(site_id) |> 
+  mutate(area_p = as.numeric(area/sum(area))) |>
+  slice_max(order_by = area_p) 
+
+sites_buff_dist_max |> 
+  mutate(area_p = cut(area_p, c(0,.5,.6,.7,.8,.9,1))) |> 
+  janitor::tabyl(area_p)
+
+```
+
+For the majority of sites, a 5km radius falls >90% over a single district (as opposed to being distributed across several districts).
+
+Finally link ES samples to NPEV prevalence by this majority district and time period:
+
+```{r}
+
+es |> 
+  # Drop existing guid
+  select(-guid) |> 
+  left_join(sites_buff_dist_max, by = "site_id") |> 
+  left_join(npev_prev |> select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
+  select(guid, guid_pop_dens, site_id:coord_imp, catchment_pop_5k, catchment_cat_5k, 
+         year, month,
+         pred_mean, pred_sd, everything()) -> es_npev2
+
+```
+
+### 3. By modelled watershed
+
+Same process as for buffers, with watershed polygons:
+
+```{r}
+
+es_sites <- readRDS("./data/Pakistan/es_sites.rds") |> 
+  rownames_to_column("id")
+
+sites <- left_join(sites, es_sites |> select(site_id, id))
+
+sites_catch <- left_join(sites |> st_drop_geometry(), catchments) 
+
+```
+
+```{r}
+
+# catchments <- readRDS(...)
+catchments <- filter(catchments, !is.na(id))
+
+sites_catch <- st_join(sites, catchments, st_is_within_distance, dist = set_units(100,"m")) |> 
+  group_by(site_id) |> 
+  slice_head(n = 1)
+
+tabyl(sites_catch, site_id) |> View()
+catch_sites <- catchments |> 
+  right_join(st_drop_geometry(sites_catch |> select(site_id, id)))
+
+ggplot() + 
+  geom_sf(data = shape2) + 
+  geom_sf(data = catch_sites |> filter(grepl("PAK/AJ",site_id)), aes(geometry = geometry)) + 
+  geom_sf(data = sites_catch |> filter(grepl("PAK/AJ",site_id)), aes(geometry = geometry), col = "red")
+
+```
+
+```{r}
+
+catch_dist <- st_intersection(catchments, select(shape2, guid))
+
+catch_dist_max <- catch_dist |> 
+  mutate(area = st_area(catch_dist)) |> 
+  st_drop_geometry() |> 
+  group_by(site_id) |> 
+  mutate(area_p = as.numeric(area/sum(area))) |>
+  slice_max(order_by = area_p) 
+
+catch_dist_max |> 
+  mutate(area_p = cut(area_p, c(0,.5,.6,.7,.8,.9,1))) |> 
+  janitor::tabyl(area_p)
+
+```
+
+
+# Descriptive
+
+```{r}
+
+n_distinct(es$site_id)
+
+es |> 
+  group_by(year, month) |> 
+  summarise(n_sites = n_distinct(site_id),
+            n_samples = n()) |> 
+  ungroup() |> 
+  ggplot(aes(month, n_sites)) +
+  geom_col() +
+  geom_line(aes(y = n_samples)) +
+  scale_y_continuous(name = "No. unique sites / collected samples") +
+  labs(x = NULL)
+
+es |> 
+  group_by(year, month) |> 
+  summarise(n_sites = n_distinct(site_id),
+            samp_per_site = n()/n_sites) |> 
+  ungroup() |> 
+  ggplot(aes(month, n_sites)) +
+  geom_col() +
+  geom_line(aes(y = samp_per_site*100)) +
+  scale_y_continuous(name = "No. unique sites",
+                     sec.axis = sec_axis(trans=~./100, 
+                                         name = "Monthly samples per site")) +
+  labs(x = NULL) -> p_collect
+
+p_collect
+```
+Summarise site level prevalence for those that meet minimum sample size:
+```{r}
+
+es |> 
+  mutate(npev = npev_f == "NPEV+") |> 
+  tbl_summary(include = c(pv, npev),
+              by = year,
+              label = list(pv = "Poliovirus positives",
+                           npev = "NPEV positives")) |> 
+  add_overall() |> 
+  as_gt()
+
+es |> 
+  filter(incl_site) |> 
+  group_by(year, month, site_id) |> 
+  summarise(n_samp = n(),
+            n_npev = sum(npev_f=="NPEV+"),
+            p_npev = n_npev/n_samp) |> 
+  ungroup() |> 
+  tbl_summary(include = c(n_samp, n_npev, p_npev),
+              by = year,
+              label = list(n_samp = "Collected samples", 
+                           n_npev = "NPEV positives", 
+                           p_npev = "Crude NPEV prevalence")) |> 
+  add_overall() |> 
+  as_gt()
+
+es |> 
+  filter(incl_site) |> 
+  group_by(year, site_id) |> 
+  summarise(n_samp = n(),
+            n_pv = sum(pv),
+            n_npev = sum(npev_f=="NPEV+"),
+            p_npev = n_npev/n_samp) |> 
+  ungroup() |> 
+  tbl_summary(include = c(n_samp, n_pv, n_npev, p_npev),
+              by = year,
+              label = list(n_samp = "Collected samples", 
+                           n_pv = "Poliovirus positives", 
+                           n_npev = "NPEV positives", 
+                           p_npev = "Crude NPEV prevalence")) |> 
+  add_overall() |> 
+  as_gt()
+
+es |> 
+  filter(incl_site) |> 
+  group_by(site_id) |> 
+  summarise(n_samp = n(),
+            n_pv = sum(pv),
+            n_npev = sum(npev_f=="NPEV+"),
+            p_npev = n_npev/n_samp) |> 
+  ungroup() |> 
+  tbl_summary(include = c(n_samp, n_pv, n_npev, p_npev),
+              label = list(n_samp = "Collected samples", 
+                           n_pv = "Poliovirus positives", 
+                           n_npev = "NPEV positives", 
+                           p_npev = "Crude NPEV prevalence")) |> 
+  as_gt()
+
+```
+
+Look at the distribution of PV+ samples over time:
+
+```{r}
+
+tabyl(es$pv)
+
+es |> 
+  group_by(month) |> 
+  summarise(npv = sum(!pv),
+            pv = sum(pv)) |> 
+  pivot_longer(npv:pv) |> 
+  mutate(name = factor(name, labels = c("Non-polio","Polio"))) |> 
+  ggplot(aes(month, value, fill = name)) +
+  geom_col(position = position_dodge()) +
+  scale_fill_manual(values = c("grey", "black")) +
+  scale_y_continuous(trans = "sqrt") +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = "Month", y = "No. samples", fill = NULL) -> p_pvpos
+p_pvpos
+
+```
+
+-> increasing since mid-2023. 
+-> Reduced sample size in recent years - will this be a problem?
+
+```{r}
+
+p_collect + p_pvpos +
+  plot_annotation(tag_levels = "A")
+ggsave("./figures/descriptive/es/es_time.png",
+       height = 4, width = 10, bg = "white")
+
+```
+
+```{r}
+
+# Samples by month of year
+es |> 
+  group_by(month_of_year) |> 
+  summarise(n = n(),
+            npev = sum(!is.na(npev)),
+            p_npev = npev*100/n) |> 
+  ungroup() -> es_moy
+
+ggplot() + 
+  geom_bar(data = es, 
+           aes(month_of_year, fill = npev_f)) + 
+  geom_line(data = es_moy, 
+            aes(x = month_of_year, y = p_npev*6,
+                group = 1)) +
+  scale_y_continuous(name = "Collected samples", 
+                     sec.axis = sec_axis(trans=~./6, 
+                                         name = NULL)) +
+  scale_fill_manual(values = c("grey","indianred")) +
+  theme(legend.position = c(0.1,0.9)) +
+  labs(x = "Collection month", fill = NULL) -> p_npev
+
+es |> 
+  group_by(year, month_of_year) |> 
+  summarise(n = n(),
+            npev = sum(!is.na(npev)),
+            p_npev = npev*100/n) |> 
+  ungroup() |>
+  ggplot(aes(month_of_year, p_npev, 
+             col = as.factor(year),
+             group = as.factor(year))) + 
+  geom_point() +
+  geom_smooth(se = F) +
+  scale_colour_viridis_d(option = "mako", end = 0.8) +
+  ylim(0,100) +
+  theme(legend.position = c(0.1,0.9)) +
+  labs(x = "Collection month", y = "% Positive", col = NULL) -> p_npev_yr
+```
+
+```{r}
+
+p_npev + p_npev_yr + 
+  plot_annotation(tag_levels = "A")
+
+ggsave("./figures/descriptive/es/npev_time.png",
+       height = 4, width = 10, bg = "white")
+```
+
+Look at rates of NPEV detection at sites given predicted underlying prevalence, by month and year:
+
+```{r}
+
+es_npev1 |> 
+  ggplot(aes(x = as.factor(year), y = pred_mean, col = npev_f)) +
+  geom_boxplot() + 
+  scale_colour_manual(values = c("grey","indianred")) +
+  theme(legend.position = c(0.9,0.9)) +
+  labs(col = NULL, y = "Predicted district prevalence",
+       x = NULL)
+
+es_npev1 |> 
+  ggplot(aes(x = month_of_year, y = pred_mean, col = npev_f)) +
+  geom_boxplot() + 
+  scale_colour_manual(values = c("grey","indianred")) +
+  theme(legend.position = c(0.9,0.9)) +
+  labs(col = NULL, y = "Predicted district prevalence",
+       x = NULL)
+
+```
+Very little difference between these two definitions (since majority of 5k buffers fall within one district, same as site location).
+
+```{r}
+
+
+es_npev1 |> 
+  ggplot(aes(x = site_type, y = pred_mean, col = npev_f)) +
+  geom_boxplot() + 
+  scale_colour_manual(values = c("grey","indianred")) +
+  theme(legend.position = c(0.9,0.9)) +
+  labs(col = NULL, y = "Predicted district prevalence",
+       x = NULL)
+
+es_npev1 |> 
+  mutate(travel_time_cat = cut(travel_time/(3600*24), 
+                               breaks = c(0,14,Inf),
+                               labels = c("< 2 weeks", ">=2 weeks"))) |> 
+  filter(!is.na(travel_time_cat)) |> 
+  ggplot(aes(x = travel_time_cat, y = pred_mean, col = npev_f)) + 
+  geom_boxplot() + 
+  scale_colour_manual(values = c("grey","indianred")) +
+  scale_y_continuous(trans = "sqrt") + 
+  theme(legend.position = c(0.9,0.9)) +
+  labs(col = NULL, y = "Predicted district prevalence",
+       x = "Time from collection to receipt at lab")
+
+es_npev1 |> 
+  ggplot(aes(x = catchment_cat_5k, y = pred_mean, col = npev_f)) + 
+  geom_boxplot() + 
+  scale_colour_manual(values = c("grey","indianred")) +
+  scale_y_continuous(trans = "sqrt") + 
+  theme(legend.position = c(0.9,0.9)) +
+  labs(x = "5km catchment size", y = "Predicted district prevalence", col = NULL)
+
+```
+
+# Model setup
+
+We start with a logistic model of NPEV-positivity per sample, given monthly NPEV prevalence of the district as a covariate with measurement error and a site-level random effect.
+
+Then explore adding season of collection, site type and catchment population size.  
+
+Investigate: 
++ Random slopes with prevalence by site
++ Interaction prevalence and site type
++ Interaction prevalence and season
+
+Questions:
+Are samples from different sites differentially associated with underlying prevalence?
+Does [site type/season] modify the strength of association between detection and underlying prevalence?
+
+## Data setup and prior checks
+
+```{r}
+
+fitdata <- es_npev1 |> 
+  mutate(y = as.numeric(!is.na(npev)),
+         t = as.numeric(as.factor(month)),
+         month_of_year = as.factor(as.numeric(month_of_year)),
+         year_f = factor(year),
+         dist_t_id = paste(guid,t,":"),
+         season = as.factor(lubridate::quarter(month)),
+         log_pop_5k = log(catchment_pop_5k))
+
+```
+
+Baseline model with only site-specific random intercept:
+
+```{r}
+
+f_base = bf(y ~ 0 + (1|site_id) + (1|t))
+
+# Check default priors given this formula
+get_prior(f_base, fitdata, family = bernoulli)
+
+# Respecify priors to be more informative
+prior_base <- c(prior(exponential(0.5), class = sd))
+
+## Check prior predictive fit
+pp_base <- brm(f_base,
+               data = fitdata,
+               family = "bernoulli",
+               prior = prior_base,
+               sample_prior = "only",
+               file_refit = "on_change",
+               file = "output/pp_es_base.rds")
+
+```
+First check priors:
+
+```{r}
+
+summary(pp_base)
+plot(pp_base)
+
+pp_check(pp_base, "bars")
+
+```
+
+## Base model
+
+```{r}
+
+fit_base <- brm(f_base, 
+               data = fitdata,
+               family = "bernoulli",
+               prior = prior_base,
+               refresh=250,
+               empty=FALSE, init = 0.2,
+               iter = 2000, chains = 4, 
+               cores = parallel::detectCores(),
+               control = list(adapt_delta = 0.96),
+               save_pars = save_pars(all = T),
+               file_refit = "on_change",
+               file = "output/fit_es_base.rds") 
+
+```
+
+
+```{r}
+summary(fit_base)
+bayes_R2(fit_base)
+```
+
+```{r}
+
+mcmc_areas(fit_base, 
+           pars = get_variables(fit_base)[1:10])
+
+# Prior predictive checks
+pp_check(fit_base)
+pp_check(fit_base, "bars")
+
+fit_base %>%
+  gather_draws(r_site_id[site_id,]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, site_id, admin_1) |> distinct()) -> summ_iid
+
+summ_iid |> 
+  arrange(admin_1, site_id) |> 
+  mutate(id = row_number()) |> 
+  ggplot(aes(id, .value,
+             ymin = .lower, ymax = .upper,
+             col = admin_1)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar(lwd = 0.1) + 
+  geom_point() +
+  labs(x = "Site", y = "Posterior estimate", col = "Province",
+       subtitle = "IID effect") +
+  scale_colour_manual(values = pal_prov) + 
+  theme(axis.text.x = element_blank())
+
+```
+
+Different extent of variability in sites between provinces.
+
+Sindh weidly consistent?
+
+## Adjusting for district prevalence and season
+
+```{r}
+
+f1 = bf(y ~ 0 + me(pred_mean, pred_sd, gr = dist_t_id) + month_of_year + (1|site_id))
+
+# Respecify priors to be more informative
+prior1 <- c(prior(normal(0,1), class = b),
+                prior(exponential(0.5), class = sd),
+                prior(normal(0,1), class = meanme),
+                prior(exponential(0.5), class = sdme)
+                )
+```
+
+```{r}
+
+fit1 <- update(fit_base,
+               formula = f1, 
+               newdata = fitdata,
+               prior = prior1,
+               recompile = T,
+               file_refit = "on_change",
+               file = "output/fit_es_1.rds") 
+
+```
+
+```{r}
+summary(fit1)
+bayes_R2(fit1)
+```
+
+```{r}
+
+mcmc_areas(fit1, 
+           pars = get_variables(fit1)[1:14]) + 
+  geom_vline(xintercept = 0, lty = "dashed", col = "grey")
+
+```
+
+## Differential district prevalence effect by season
+
+```{r}
+
+f2 = bf(y ~ 0 + me(pred_mean, pred_sd, gr = dist_t_id)*month_of_year + (1|site_id))
+
+# Respecify priors to be more informative
+prior2 <- c(prior(normal(0,1), class = b),
+                prior(exponential(0.5), class = sd),
+                prior(normal(0,1), class = meanme),
+                prior(exponential(0.5), class = sdme)
+                )
+
+```
+
+```{r}
+
+fit2 <- update(fit_base,
+               formula = f2, 
+               newdata = fitdata,
+               prior = prior1,
+               recompile = T,
+               empty=FALSE, init = 0.2,
+               iter = 5000, chains = 4, thin = 10,
+               cores = parallel::detectCores(),
+               control = list(adapt_delta = 0.96),
+               save_pars = save_pars(all = T),
+               file_refit = "on_change",
+               file = "output/fit_es_2.rds") 
+
+```
+
+```{r}
+summary(fit2)
+bayes_R2(fit2)
+```
+
+```{r}
+
+vars <- get_variables(fit2)
+
+mcmc_areas(fit2, 
+           pars = vars[grepl("b_month",vars)]) +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  scale_y_discrete(labels=rev(month.abb)) + 
+  labs(x = "Posterior estimate", 
+       title = "Month coefficient") -> p_mth_coef
+
+mcmc_areas(fit2, 
+           pars = "bsp_mepred_meanpred_sdgrEQdist_t_id") +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  theme(axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  labs(x = "Posterior estimate", 
+       title = "District prevalence coefficient",
+       subtitle = "Reference level: January") -> p_me
+
+p_me
+
+mcmc_areas(fit2, 
+           pars = vars[grepl("dist_t_id:month",vars)]) +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  scale_y_discrete(labels=rev(month.abb)) +
+  labs(x = "Posterior estimate", 
+       title = "Prevalence:Month interaction terms") -> p_mth_me_int
+
+p_mth_me_int
+
+p_tmp <- p_me / p_mth_me_int + 
+  plot_layout(heights = c(1,3)) 
+
+p_mth_coef + p_tmp +
+  plot_annotation(tag_levels = "A")
+
+ggsave("./figures/es model/coefs_mth.png",
+       height = 6, width = 8, bg = "white")
+
+```
+
+```{r}
+
+fit2 %>%
+  spread_draws(bsp_mepred_meanpred_sdgrEQdist_t_id) -> me_main_draws
+
+season_vars <- paste0('bsp_mepred_meanpred_sdgrEQdist_t_id:month_of_year',2:12)
+season_draws <- lapply(season_vars, \(x) fit2 |> spread_draws(!!sym(x)) |> select(-1:-2))
+
+season_draws |> 
+  purrr::reduce(left_join, by = ".draw") |>
+  pivot_longer(cols = -.draw, 
+               names_prefix = "bsp_mepred_meanpred_sdgrEQdist_t_id:month_of_year",
+               names_to = "month") -> season_draws_long
+
+me_main_draws |> 
+  right_join(season_draws_long) |> 
+  bind_rows(mutate(me_main_draws, month = "1")) |> 
+  arrange(.draw, month) |>  
+  mutate(month = as.numeric(month),
+         month_abb = factor(month.abb[month], levels = month.abb),
+         estimate = bsp_mepred_meanpred_sdgrEQdist_t_id + replace_na(value, 0)) -> draws_me_season
+
+draws_me_season |> 
+  group_by(month) |> 
+  median_qi(estimate, .width = 0.5) |> 
+  ungroup() |> 
+  mutate(month_abb = factor(month.abb[month], levels = month.abb)) -> summ_me_season
+
+draws_me_season |> 
+  # mutate(estimate = exp(estimate)) |> 
+ggplot(aes(month_abb)) + 
+  geom_hline(yintercept = 0, alpha = 0.5) +
+  stat_halfeye(aes(y = estimate),
+               fill = "lightsteelblue2") + 
+  # geom_point(data = summ_me_season, 
+  #               aes(y = estimate)) + 
+  # ylim(-1,1) +
+  coord_flip() +
+  scale_x_discrete(limits = rev(month.abb)) +
+  labs(x = "Month", y = "Posterior estimate", 
+       title = "Total district prevalence coefficient",
+       subtitle = "By month") -> p_me_coef
+
+p_me_coef
+ggsave("./figures/es model/me_coef_month.png",
+       height = 5, width = 6, bg = "white")
+
+p_mth_coef + p_tmp + p_me_coef +
+  plot_layout(widths = c(2,2,3)) +
+  plot_annotation(tag_levels = "A")
+
+ggsave("./figures/es model/prev_mth_coefs.png",
+       height = 6, width = 12, bg = "white")
+
+```
+
+# Explore site-level residual variability
+
+Since we've excluded an overall intercept, the site level effects reflect the overall site-level intercept after accounting for variability by season and underlying prevalence. We can therefore look at these as estimates of probability of detection "adjusted" for season and prevalence. 
+
+i.e. we can compare sites according to their adjusted probability of detection.
+
+What benchmark do we use here? We want a threshold on sensitivity. 
+
+```{r}
+
+fit2 |> 
+  gather_draws(r_site_id[site_id,]) |> 
+  mutate(.value = boot::inv.logit(.value)) |> 
+  median_qi() |> 
+  mutate(flag = .upper < 0.5) -> summ_me
+n_flagged <- sum(summ_me$flag)
+
+summ_me |> 
+  arrange(.value, site_id) |> 
+  mutate(id = row_number()) |> 
+  ggplot(aes(id, .value,
+             ymin = .lower, ymax = .upper,
+             col = flag
+             )) + 
+  geom_hline(yintercept = 0.5, col = "black", lty = "dashed") +
+  geom_errorbar(lwd = 0.1) + 
+  geom_point() +
+  labs(x = "Site", y = "Posterior estimate + 95% CrI", col = "Province",
+       subtitle = "Residual site-specific effect - Adjusted model",
+       caption = paste0(n_flagged, " sites with upper CrI < 50%")) +
+  scale_colour_manual(values = c("grey20","indianred")) +
+  guides(col = "none") +
+  coord_flip() -> p_site_adj
+
+p_site_adj
+ggsave("./figures/es model/site_re_adj.png",
+       height = 6, width = 6, bg = "white")
+
+```
+
+Compare low flagged sites with overall NPEV prevalence:
+
+```{r}
+
+fit_base |> 
+  gather_draws(r_site_id[site_id,]) |> 
+  mutate(.value = boot::inv.logit(.value)) |>
+  median_qi() |> 
+  mutate(flag = .upper < 0.5) -> summ_base
+n_flagged <- sum(summ_base$flag)
+
+summ_base |> 
+  arrange(.value, site_id) |> 
+  mutate(id = row_number()) |> 
+  ggplot(aes(id, .value,
+             ymin = .lower, ymax = .upper,
+             col = flag
+             )) + 
+  geom_hline(yintercept = 0.5, col = "black", lty = "dashed") +
+  geom_errorbar(lwd = 0.1) + 
+  geom_point() +
+  labs(x = "Site", y = "Posterior estimate + 95% CrI", col = "Province",
+       subtitle = "Residual site-specific effect - unadjusted model",
+       caption = paste0(n_flagged, " sites with upper CrI < 50%")) +
+  scale_colour_manual(values = c("grey20","indianred")) +
+  guides(col = "none") +
+  coord_flip() -> p_site_base
+
+p_site_base
+ggsave("./figures/es model/site_re_base.png",
+       height = 6, width = 6, bg = "white")
+
+# Crude NPEV prevalence
+
+fitdata |> 
+  group_by(site_id,year) |> 
+  summarise(npev = sum(!is.na(npev)),
+         n = n(),
+         p_npev = npev/n,
+         lo = Hmisc::binconf(npev, n)[,2],
+         hi = Hmisc::binconf(npev, n)[,3]) |> 
+  ungroup() |> 
+  mutate(flag = hi < 0.5) -> flag_sites
+n_flagged <- sum(flag_sites$flag)
+
+flag_sites |> 
+  arrange(p_npev) |> 
+  mutate(id = row_number()) |> 
+  ggplot(aes(id, p_npev,
+             ymin = lo, ymax = hi,
+             col = flag
+             )) + 
+  geom_hline(yintercept = 0.5, col = "black", lty = "dashed") +
+  geom_errorbar(lwd = 0.1) + 
+  geom_point() +
+  facet_wrap(~year) +
+  labs(x = "Site", y = "Posterior estimate + 95% CrI", col = "Province",
+       subtitle = "Crude NPEV prevalence",
+       caption = paste0(n_flagged, " sites with upper CI < 50%")) +
+  scale_colour_manual(values = c("grey20","indianred")) +
+  guides(col = "none") +
+  coord_flip() -> p_site_crude
+p_site_crude
+ggsave("./figures/es model/site_p_crude.png",
+       height = 6, width = 6, bg = "white")
+
+```
+
+```{r}
+
+p_site_base + p_site_adj +
+  plot_annotation(tag_levels = "A")
+
+ggsave("./figures/es model/site_re_compare.png",
+       height = 6, width = 10, bg = "white")
+
+```
+
+Which sites are flagged in each instance?
+
+```{r}
+
+flag_sites |> 
+  left_join(select(summ_base, site_id, flag), by = "site_id", suffix = c(".crude",".base")) |> 
+  left_join(select(summ_me, site_id, flag) |> rename(flag.me = flag), by = "site_id") -> flag_sites
+
+```
+
+```{r}
+
+tabyl(flag_sites |> filter(year == 2021), flag.crude, flag.base, flag.me)
+tabyl(flag_sites |> filter(year == 2022), flag.crude, flag.base, flag.me)
+tabyl(flag_sites |> filter(year == 2023), flag.crude, flag.base, flag.me)
+tabyl(flag_sites |> filter(year == 2024), flag.crude, flag.base, flag.me)
+
+flag_sites |> 
+  group_by(year) |> 
+  tbl_summary(include = c(flag.base, flag.me),
+              by = flag.crude) |> 
+  add_overall()
+
+```
+
+```{r}
+
+flag_sites |> 
+  left_join(summ_base |> select(site_id, .value,.lower,.upper)) |> 
+  ggplot(aes(x = p_npev, xmin = lo, xmax = hi,, y = .value, ymin = .lower, ymax = .upper)) +
+  geom_abline(lty= "dashed", col = "darkgrey") +
+  geom_errorbar(alpha = 0.1) + 
+  geom_errorbarh(alpha = 0.1) + 
+  facet_wrap(~year) +
+  labs(x = "Crude NPEV prevalence",
+       y = "Modelled prevalence",
+       title = "Estimated site-specific NPEV prevalence",
+       subtitle = "Unadjusted") -> crude_vs_base
+
+flag_sites |> 
+  left_join(summ_me |> select(site_id, .value,.lower,.upper)) |> 
+  ggplot(aes(x = p_npev, xmin = lo, xmax = hi,, y = .value, ymin = .lower, ymax = .upper)) +
+  geom_abline(lty= "dashed", col = "darkgrey") +
+  geom_errorbar(alpha = 0.1) + 
+  geom_errorbarh(alpha = 0.1) + 
+  labs(x = "Crude NPEV prevalence",
+       y = "Modelled prevalence",
+       title = "Estimated site-specific NPEV prevalence",
+       subtitle = "Adjusted for district prevalence and season") -> crude_vs_adj
+
+crude_vs_base + crude_vs_adj + 
+  plot_annotation(tag_levels = "A")
+
+ggsave("./figures/es model/site_re_compare_crude.png",
+       height = 6, width = 10, bg = "white")
+
+```
+
+## Add year
+
+```{r}
+
+fitdata <- mutate(fitdata, year_2022 = (year == 2022)) 
+f_me_yr = bf(y ~ 0 + me(pred_mean, pred_sd, gr = dist_t_id)*month_of_year*year_2022 + (1|site_id))
+
+fit2_yr <- brm(f_me_yr, 
+               data = fitdata,
+               family = "bernoulli",
+               prior = prior_me,
+               refresh=250,
+               empty=FALSE, init = 0.2,
+               iter = 5000, chains = 4, thin = 10,
+               cores = parallel::detectCores(),
+               control = list(adapt_delta = 0.96),
+               save_pars = save_pars(all = T),
+               file_refit = "on_change",
+               file = "output/fit_es_me_yr.rds") 
+
+```
+
+```{r}
+
+summary(fit2_yr)
+bayes_R2(fit2_yr)
+
+```
+
+```{r}
+
+vars <- get_variables(fit2_yr)
+
+# mcmc_areas(fit2_yr, 
+#            pars = vars[1:49]) +
+#   geom_vline(xintercept = 0, alpha = 0.5) +
+#   # scale_y_discrete(labels=rev(month.abb)) + 
+#   labs(x = "Posterior estimate", 
+#        title = "Month coefficient")
+
+mcmc_areas(fit2_yr, 
+           pars = vars[grepl("b_month",vars)]) +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  # scale_y_discrete(labels=rev(month.abb)) + 
+  labs(x = "Posterior estimate", 
+       title = "Month coefficient") -> p_mth_coef
+p_mth_coef
+
+mcmc_areas(fit2_yr, 
+           pars = vars[grepl("dist_t_id",vars)]) +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  labs(x = "Posterior estimate", 
+       title = "District prevalence coefficient",
+       subtitle = "Reference level: January, excl. 2022") -> p_me
+
+p_me
+
+mcmc_areas(fit2_yr, 
+           pars = vars[grepl("dist_t_id:month",vars)]) +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  # scale_y_discrete(labels=rev(month.abb)) +
+  labs(x = "Posterior estimate", 
+       title = "Prevalence:Month interaction terms") -> p_mth_me_int
+
+p_mth_me_int
+
+```
+
+```{r}
+
+# Draws of the January coefficient for 2022/other:
+fit2_yr %>%
+  spread_draws(bsp_mepred_meanpred_sdgrEQdist_t_id) |> 
+  rename(estimate_jan = 4) -> me_main_draws
+
+fit2_yr %>%
+  spread_draws(`bsp_mepred_meanpred_sdgrEQdist_t_id:year_2022TRUE`) |> 
+  rename(comp_jan_22 = 4) -> me_main22_draws
+
+me_main_draws |> 
+  left_join(me_main22_draws) |> 
+  mutate(year = "2022") |> 
+  bind_rows(mutate(me_main_draws, year = "Other")) |> 
+  mutate(estimate_jan = estimate_jan + replace_na(comp_jan_22,0)) |> select(-comp_jan_22) -> jan_effect_byyr
+  
+# Draws of the added component for months 2-12 (not 2022):
+season_vars <- paste0('bsp_mepred_meanpred_sdgrEQdist_t_id:month_of_year',2:12)
+season_draws <- lapply(season_vars, \(x) fit2_yr |> spread_draws(!!sym(x)) |> select(-1:-2))
+season_draws |> 
+  purrr::reduce(left_join, by = ".draw") |>
+  pivot_longer(cols = -.draw, 
+               names_prefix = "bsp_mepred_meanpred_sdgrEQdist_t_id:month_of_year",
+               names_to = "month",
+               values_to = "estimate_season") -> season_draws_long
+
+# Draws of the added component for months 2-12 (2022):
+season_22_vars <- paste0('bsp_mepred_meanpred_sdgrEQdist_t_id:month_of_year',2:12,":year_2022TRUE")
+season_22_draws <- lapply(season_22_vars, \(x) fit2_yr |> spread_draws(!!sym(x)) |> select(-1:-2))
+season_22_draws |> 
+  purrr::reduce(left_join, by = ".draw") |>
+  pivot_longer(cols = -.draw, 
+               names_prefix = "bsp_mepred_meanpred_sdgrEQdist_t_id:month_of_year",
+               names_sep = ":year_",
+               names_to = c("month","year"),
+               names_transform = list(year = ~str_remove_all(., "[^0-9]")),
+               values_to = "comp_season_22") -> season_22_draws_long
+
+season_draws_long |> 
+  left_join(season_22_draws_long) |>
+  bind_rows(mutate(season_draws_long, year = "Other")) |>
+  mutate(estimate_season = estimate_season + replace_na(comp_season_22,0)) |> select(-comp_season_22) -> season_effect_byyr
+  
+# Combine draws for months 1-12, year 2022/other
+# Start with january coefficients, then merge by draw/year
+jan_effect_byyr |> 
+  left_join(season_effect_byyr) |>
+  bind_rows(mutate(jan_effect_byyr, month = "1")) |> 
+  mutate(month = as.numeric(month),
+         month_abb = factor(month.abb[month], levels = month.abb),
+         estimate = estimate_jan + replace_na(estimate_season, 0)) |> 
+  arrange(.draw, month, year) -> draws_me_season_yr
+
+draws_me_season_yr |> 
+  group_by(month, year) |> 
+  median_qi(estimate, .width = 0.5) |> 
+  ungroup() |> 
+  mutate(month_abb = factor(month.abb[month], levels = month.abb)) -> summ_me_season_yr
+
+draws_me_season_yr |> 
+  ggplot(aes(month_abb, fill = year, col = year)) + 
+    geom_hline(yintercept = 0, alpha = 0.5) +
+    stat_halfeye(aes(y = estimate), slab_alpha = 0.5) + 
+    coord_flip() +
+    scale_x_discrete(limits = rev(month.abb)) +
+    scale_colour_manual("Year", values = c("steelblue4","indianred4"), labels = c("Other", "2022")) +
+    scale_fill_manual("Year", values = c("steelblue1","indianred1"), labels = c("Other", "2022")) +
+  theme(legend.position = c(0.9,0.9)) +
+    labs(x = "Month", y = "Posterior estimate", 
+         fill = NULL,
+         title = "Total district prevalence coefficient",
+         subtitle = "By month") -> p_me_coef_yr
+
+p_me_coef_yr
+ggsave("./figures/es model/me_coef_month_yr.png",
+       height = 5, width = 6, bg = "white")
+
+```
+
+
+# Compare Models
+
+```{r}
+
+waic(fit_base, fit1, fit2, fit2_yr)
+
+```
+
+Model with 3-way interaction by year:season is preferred. 
+
+# Alternative without interaction
+
+Simpler model structure to include all potential drivers of detection probability: 
++ Underlying prevalence (captures spatial and seasonal trend in NPEV prevalence)
++ Season of sampling (different trend by year)
++ Site type
++ Site residual
+
+The hypothesis is that trends we see in ES detection are a combination of epidemiology and surveillance sensitivity.
+
+The interaction would be interpreted as ES sensitivity dependent on prevalence? No... 
+- Coefficient of prevalence is the association between probability of detection and underlying prevalence
+  + For an increase in prevalence what's the associated increase in probability of detection?
+- If this itself is seasonal, that reflects a greater increase in probability of detection at certain times of year
+
+Can the coefficient of prevalence be interpreted as the sensitivity? This would mean an interaction with season reflected seasonal variation in sensitivity? 
+
+There's a different baseline probability of detection throughout the year, separate to prevalence (this is the independent seasonal effect).
+- I think this is all we need to look at? 
+
+```{r}
+
+fitdata <- mutate(fitdata, month_of_year_n = as.numeric(month_of_year))
+f3 = bf(y ~ 0 + me(pred_mean, pred_sd, gr = dist_t_id) +
+          s(month_of_year_n, bs = "cc", k = 12, by = year_f) + 
+          site_type + (1|site_id))
+
+# Respecify priors to be more informative
+prior3 <- c(prior(normal(0,1), class = b),
+                prior(exponential(0.5), class = sd),
+                prior(normal(0,1), class = meanme),
+                prior(exponential(0.5), class = sdme)
+                )
+
+```
+
+```{r}
+
+fit3 <- update(fit_base,
+               formula = f3, 
+               newdata = fitdata,
+               prior = prior3,
+               recompile = T,
+               save_pars = save_pars(all = T),
+               file_refit = "on_change",
+               file = "output/fit_es_3.rds") 
+
+```
+
+```{r}
+
+summary(fit3)
+bayes_R2(fit3)
+```
+Do we want to save noise-free latent variables? 
+
+```{r}
+
+vars <- get_variables(fit3)
+
+mcmc_areas(fit3, 
+           pars = vars[1:8]) +
+  geom_vline(xintercept = 0, alpha = 0.5) +
+  labs(x = "Posterior estimate") 
+
+#plot(conditional_smooths(fit3))
+
+```
+## Site-level residual variability
+
+```{r}
+
+fit3 |> 
+  gather_draws(r_site_id[site_id,]) |> 
+  mutate(.value = boot::inv.logit(.value)) |> 
+  median_qi() |> 
+  mutate(flag = .upper < 0.5) -> summ_iid
+n_flagged <- sum(summ_iid$flag)
+
+summ_iid |> 
+  arrange(.value, site_id) |> 
+  mutate(id = row_number()) |> 
+  ggplot(aes(id, .value,
+             ymin = .lower, ymax = .upper,
+             col = flag
+             )) + 
+  geom_hline(yintercept = 0.5, col = "black", lty = "dashed") +
+  geom_errorbar(lwd = 0.1) + 
+  geom_point() +
+  labs(x = "Site", y = "Posterior estimate + 95% CrI", col = "Province",
+       subtitle = "Residual site-specific effect - Adjusted model",
+       caption = paste0(n_flagged, " sites with upper CrI < 50%")) +
+  scale_colour_manual(values = c("grey20","indianred")) +
+  guides(col = "none") +
+  coord_flip() -> p_site_adj
+
+p_site_adj
+# ggsave("./figures/es model/site_re_adj.png",
+#        height = 6, width = 6, bg = "white")
+
+```
+# Explore final fit
+
+```{r}
+
+fit2b %>%
+  gather_draws(r_site_id[site_id,]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, site_id, admin_1) |> distinct()) -> summ_iid
+
+summ_iid |> 
+  arrange(admin_1, site_id) |> 
+  mutate(id = row_number()) |> 
+  ggplot(aes(id, .value,
+             ymin = .lower, ymax = .upper,
+             col = admin_1)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar(lwd = 0.1) + 
+  geom_point() +
+  labs(x = "Site", y = "Posterior estimate", col = "Province",
+       subtitle = "IID effect - final model") +
+  scale_colour_manual(values = pal_prov) + 
+  theme(axis.text.x = element_blank())
+
+fit2b %>%
+  gather_draws(z_1[,dist_t_id]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, dist_t_id, admin_1) |> 
+              distinct() |> 
+              mutate(dist_t_id = as.numeric(as.factor(dist_t_id)))) -> summ_me
+
+summ_me |> 
+  arrange(admin_1, dist_t_id) |> 
+  mutate(id = row_number()) |> 
+  ggplot(aes(id, .value,
+             ymin = .lower, ymax = .upper,
+             col = admin_1)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar(lwd = 0.1) + 
+  geom_point() +
+  labs(x = "District:month", y = "Posterior estimate", col = "Province",
+       subtitle = "NPEV prevalence adjusted for measurement error") +
+  scale_colour_manual(values = pal_prov) + 
+  theme(axis.text.x = element_blank())
+
+```
+

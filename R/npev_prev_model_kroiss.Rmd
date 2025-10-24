@@ -1,0 +1,167 @@
+---
+title: 'Part 1: District NPEV prevalence'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+library(devtools)
+if(!require(cmdstanr)){
+  devtools::install_github("stan-dev/cmdstanr", dependencies=c("Depends", "Imports"))
+}
+if(!require(INLA)){
+install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, spdep, rstan, brms, tidybayes, bayesplot, units, loo, posterior, cmdstanr, INLA, geostan)
+theme_set(theme_minimal())
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir <- "data/Pakistan"
+
+# source("./utils/fit_npafp_model.R")
+source("./utils/check_model_fit.R")
+
+# NP-AFP analysis data
+data <- readRDS(here(dir, "afp_analysis.rds"))
+
+# Shapefiles and adjacency matrix
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+W <- readRDS(here(dir,"W.rds"))
+
+# Analysis dataset
+fitdata <- readRDS(here(dir, "fitdata.rds"))
+
+# Use fit with province level trends as a starting point
+fit_bym_prov <- readRDS("output/fit_bym_prov.rds")
+
+```
+
+```{r}
+plot_pp_checks <- function(fit){
+  
+  check_plots <- list(pp_check(fit, type = "bars"), 
+                      pp_check(fit, type = "scatter_avg"),
+                      pp_check(fit, "rootogram"))  
+  return(check_plots)
+}
+```
+
+# Model setup
+
+Number of NPEV+ AFP cases in district $i$ at time $t$:
+
+$$ Y_{i,t} \sim  Binomial(M_{i,t}, p_{i,t}) $$
+where $M_{i,t}$ is the number of notified non-polio AFP cases and $p_{i,t}$ is the estimated prevalence of NPEV in this sampled population.
+
+The prevalence per district-month is assumed dependent on overall and province-level seasonal trends, spatial correlation between neighbouring districts, and overall/district-/province-level autoregressive terms: 
+
+$$ logit(p_{i,t}) = \beta_0 + b_{p(i)} + BYM(i) + f^{cc}(month(t)) + f^{cc}_{p(i)}(month(t)) +  AR + AR_{i} + AR_{p(i)} $$
+This model cannot be constructed in brms. A simpler version with only one AR term is first fit using brms, the stan code extracted and edited to add further AR terms by province and district, then refit using cmdstanr. 
+
+Other notes:
+Based on Kroiss et al. analysis, NPEV prevalence was around 25% per month. 
+ => N(-1,1) informative prior on the global intercept. 
+
+Setting up data for fitting:
+
+```{r}
+
+fitdata <- mutate(data, 
+                  month_of_year = as.numeric(month_of_year),
+                  year_F = factor(year),
+                  guid_F = factor(guid, levels = unique(data$guid)),
+                  t_F = factor(t, levels = 1:max(data$t)),
+                  # standardise pop density for stability
+                  log_pop_dens = log(guid_pop_dens) |> as.numeric(),
+                  log_pop_dens_s = (log_pop_dens - mean(log_pop_dens))/sd(log_pop_dens)) 
+
+readr::write_rds(fitdata, "data/Pakistan/fitdata.rds")
+```
+
+
+# Fitting
+
+## Single AR term model
+
+```{r}
+
+f_kroiss = bf(
+  n_npev | trials(n_npafp) ~     
+    # Overall average prevalence
+    1 + 
+    # Province-level random intercept
+    (1|adm1_name) +
+    # Correlated/uncorrelated random intercepts by district 
+    car(W, gr = guid, type = "bym2") + 
+    # Auto-regressive term by district
+    ar(t, gr = guid) +
+    # Seasonal temporal splines, overall and by province
+    s(month_of_year, bs = "cc", k = 12) +
+    s(month_of_year, bs = "cc", k = 12, by = adm1_name) 
+  )
+
+# Check default priors given this formula
+get_prior(f_kroiss, 
+          data = fitdata, 
+          data2 = list(W = W), 
+          family = binomial("logit"))
+
+prior_kroiss <- c(prior(normal(0,1), class = Intercept),
+               prior(exponential(0.5), class = sd),
+               # Tighten prior on spline wiggliness since we're now fitting 7 different ones
+               prior(exponential(1), class = sds),
+               prior(beta(0.5,0.5),class = rhocar),
+               prior(exponential(0.5),class = sdcar)
+)
+
+```
+
+Fit this model:
+
+```{r}
+
+fit_kroiss <- update(fit_bym_prov, 
+                  formula = f_kroiss,
+                  prior = prior_kroiss,
+                  newdata = fitdata,
+                  data2 = list(W = W),
+                  cores = parallel::detectCores(),
+                  iter = 4000,
+                  thin = 4,
+                  control = list(adapt_delta = 0.97),
+                  recompile = T,
+                  file = "output/fit_kroiss.rds") 
+
+```
+
+### Check fit
+
+```{r}
+
+summary(fit_kroiss)
+bayes_R2(fit_kroiss)
+
+```
+
+```{r}
+
+plot_pp_checks(fit_kroiss)
+plot(fit_kroiss)
+
+```
+
+Extract stan code:
+
+```{r}
+
+stan_kroiss <- stancode(fit_kroiss)
+cmdstanr::write_stan_file(stan_kroiss,
+                          dir = here("stan"),
+                          basename = "kroiss_base_model.stan")
+
+```

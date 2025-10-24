@@ -1,0 +1,584 @@
+---
+title: 'Part 1: District NPEV prevalence'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+library(devtools)
+if(!require(cmdstanr)){
+  devtools::install_github("stan-dev/cmdstanr", dependencies=c("Depends", "Imports"))
+}
+if(!require(INLA)){
+install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, brms, tidybayes, bayesplot,  
+               units, loo, posterior, patchwork)
+theme_set(theme_minimal())
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+dir <- "data/Pakistan"
+
+source("./utils/check_model_fit.R")
+source("./utils/plot_re_fcns.R")
+
+# Fitting data
+fitdata <- read_rds("data/Pakistan/fitdata.rds")
+
+# Shapefiles and adjacency matrix
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+W <- readRDS(here(dir,"W.rds"))
+
+# Selected model
+fit <- readRDS("output/fit_bym_prov.rds")
+
+# Define adm1-guid key for later matching:
+prov_guid <- fitdata |> 
+  select(adm1_name, guid) |> 
+  distinct() |> 
+  mutate(did = row_number())
+
+```
+
+# Final model
+
+Run final model with longer chains and save predictions:
+
+```{r}
+
+fit_final_prior <- update(fit,
+                    refresh=250,
+                    iter = 4000, chains = 4, thin = 10,
+                    cores = parallel::detectCores(),
+                    control = list(adapt_delta = 0.97),
+                    save_pars = save_pars(all = T),
+                    sample_prior = "only",
+                    file = "output/fit_final_prior.rds") 
+
+fit_final <- update(fit,
+                    refresh=250,
+                    iter = 4000, chains = 4, thin = 10,
+                    cores = parallel::detectCores(),
+                    control = list(adapt_delta = 0.97),
+                    save_pars = save_pars(all = T),
+                    file = "output/fit_final.rds") 
+
+```
+
+## Prior checks
+
+```{r}
+
+pp_check(fit_final_prior, 
+         "bars",
+         samples = 200) -> p_prior_dist
+
+mcmc_areas(fit_final_prior, 
+           pars = get_variables(fit_final_prior)[1:7],
+           prob = 0.8) -> parms_prior
+
+parms_prior +
+  ggtitle("Prior distributions",
+                      "with medians and 80% intervals")
+ggsave("./figures/final fit/prior_sample.png", 
+       height = 5, width = 6, bg = "white")
+```
+
+## Posterior checks
+
+```{r}
+
+pp_check(fit_final, 
+         "bars",
+         samples = 200) -> p_post_dist
+
+mcmc_trace(fit_final, 
+           pars = get_variables(fit_final)[1:7],
+           facet_args = list(nrow = 2))
+ggsave("figures/final fit/mcmc_trace.png",
+       height = 4, width = 8, bg = "white")
+
+p_prior_dist + p_post_dist +
+  plot_annotation(tag_levels = "A")
+
+ggsave("figures/final fit/prior_post_dist.png",
+       height = 3, width = 8, bg = "white")
+```
+
+```{r}
+
+summ_fit <- summary(fit_final)
+
+# Check Rhat and ESS 
+bind_rows(
+  summ_fit$fixed[, 5:7],
+  bind_rows(summ_fit$random)[, 5:7],
+  summ_fit$splines[, 5:7])
+
+```
+
+```{r}
+
+mcmc_areas(fit_bym_int, 
+           pars = get_variables(fit_bym_int)[1:7],
+           prob = 0.8) -> parms_post
+
+parms_post +
+  ggtitle("Posterior distributions",
+                      "with medians and 80% intervals")
+ggsave("./figures/final fit/post_sample.png", 
+       height = 5, width = 6, bg = "white")
+
+prior_draws = as_draws_df(fit_final_prior)[,1:7]
+post_draws = as_draws_df(fit_final)[,1:7]
+
+# Stack the prior and posterior draws for each parameter
+#  and reshape to long format
+prior_post_draws = bind_rows(
+    prior_draws %>% 
+      mutate(type="Prior") %>% 
+      rename_all(~gsub("prior_", "", .)),
+    post_draws %>% 
+      select(-matches("Prior")) %>% 
+      mutate(type="Posterior")
+  ) %>% 
+  pivot_longer(-type)
+
+prior_post_draws %>%
+ ggplot(aes(value, name, colour=type)) +
+  stat_slab(data = . %>% filter(type != "true value"),
+               aes(slab_colour=type), fill=NA, normalize="groups", 
+               scale=0.7, slab_size=0.5, fatten_point=1.5) +
+  geom_segment(data=. %>% filter(type=="true value"), 
+               aes(x=value, xend=value, y=name, yend=..y.. + 0.7),
+               colour="grey10", size=0.3) +
+  coord_cartesian(xlim=c(-3,3)) +
+  labs(x=NULL, y=NULL, colour=NULL, fill=NULL, slab_colour=NULL) +
+  theme(panel.grid.major.y=element_line(colour="grey10", size=0.2)) -> p_prior_post
+
+# prior_post_draws %>% 
+#   ggplot(aes(value, colour=type)) +
+#     geom_density(aes(y=after_stat(scaled))) + 
+#     facet_wrap(vars(name), scales="free") +
+#     labs(x=NULL, y=NULL, colour=NULL, fill=NULL, slab_colour=NULL) +
+#     theme(axis.text.y=element_blank(),
+#           axis.ticks.y=element_blank()) -> p_prior_post
+
+p_prior_post
+```
+
+## Fitted spatial effects
+
+### BYM component
+
+```{r}
+
+fit_final %>%
+  gather_draws(rcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> 
+              distinct() |> 
+              mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Total") -> summ_car
+
+summ_car |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", col = "Province",
+       subtitle = "Total CAR component") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+fit_final %>%
+  gather_draws(nszcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, guid_F, adm1_name) |> 
+              distinct() |> 
+              mutate(guid = as.numeric(guid_F))) |> 
+  mutate(component = "Non-spatial") -> summ_car_ns
+
+summ_car |> 
+  bind_rows(summ_car_ns) |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name,
+             alpha = component)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province", alpha = "Component",
+       subtitle = "Conditional auto-regressive (CAR) effect") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank()) -> p_car
+
+p_car
+ggsave("./figures/final fit/car.png", 
+       height = 5, width = 8, bg = "white")
+
+```
+
+### Total district deviation
+
+- Province intercept + BYM 
+- Province intercept + BYM + t:guid IID effect
+
+```{r}
+
+fit_final %>%
+  spread_draws(r_adm1_name[adm1_name, Intercept],rcar[guid]) %>% 
+  left_join(mutate(prov_guid,guid = row_number()), by = "guid") |> 
+  filter(adm1_name.x == adm1_name.y) |> 
+  median_qi(r_guid = r_adm1_name + rcar) -> tmp
+
+tmp |> 
+  left_join(mutate(prov_guid,guid = row_number())) |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, r_guid,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province",
+       subtitle = "Total district deviation from average") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+ggsave("./figures/final fit/district_effects.png", 
+       height = 5, width = 8, bg = "white")
+
+```
+
+```{r}
+
+fit_final %>%
+  spread_draws(r_adm1_name[adm1_name, Intercept],rcar[guid],`r_t:guid`[t_guid,Intercept],
+               ndraws = 50) %>% 
+  left_join(mutate(prov_guid,guid = row_number()), by = "guid") |> 
+  filter(adm1_name.x == adm1_name.y) |> 
+  median_qi(r_guid_t = r_adm1_name + rcar + `r_t:guid`) -> tmp
+
+fit_final %>%
+  gather_draws(`r_t:guid`[t_guid,Intercept]) %>% 
+  median_qi() |> 
+  separate_wider_delim(t_guid, delim = "_",
+                       names = c("t","guid"),
+                       cols_remove = T) |>
+  mutate(t = as.numeric(t),
+         guid = as.numeric(as.factor(guid))) -> summ_t_guid
+
+summ_t_guid |> 
+  ggplot(aes(t, .value, ymin = .lower, ymax = .upper, group = guid)) + 
+  # geom_ribbon(alpha = 0.005) +
+  geom_line(alpha = 0.1) + 
+  labs(x = "Month", y = "Posterior estimate", 
+       subtitle = "Estimated random deviation per month and district")
+
+summ_t_guid |> 
+  group_by(guid) |> 
+  summarise(across(.value:.upper, mean)) -> summ_guid
+
+summ_guid |>
+  left_join(tmp, by = "guid") |> 
+  left_join(prov_guid, by = c("guid"="did")) |> 
+  mutate(r_guid = r_guid + .value,
+         .lower = .lower.x + .lower.y,
+         .upper = .upper.x + .upper.y) |>
+  arrange(adm1_name, guid) |>
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, r_guid,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() +
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province",
+       subtitle = "Total district deviation from average") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+ggsave("./figures/final fit/district_effects.png", 
+       height = 5, width = 8, bg = "white")
+
+```
+
+## Fitted temporal effects
+
+### Season
+
+```{r}
+
+fit_final |> 
+  conditional_smooths() |>
+  plot(plot = F) -> tmp
+
+p_season <- ggplot_build(tmp[[1]])
+p_season$plot$labels <- list(x = NULL, y = "Overall seasonal trend")
+p_season$plot$scales$scales[[1]] <- scale_x_discrete(limits = month.abb) 
+p_season$plot$theme <- theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_season
+p_season <- last_plot()
+ggsave("./figures/final fit/season.png", 
+       height = 5, width = 7, bg = "white")
+
+```
+
+### Residual 
+
+```{r}
+
+fit_final %>%
+  gather_draws(r_t[t, Intercept]) %>%
+  median_qi() |> 
+  left_join(select(fitdata, t, month) |> distinct()) -> summ_r_t
+
+summ_r_t |>  
+  ggplot(aes(month, .value,
+             ymin = .lower, ymax = .upper)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "Month", y = "Posterior estimate", 
+       subtitle = "Month-only random effect") -> p_t_iid
+p_t_iid
+
+fit_final %>%
+  gather_draws(`r_t:guid`[t_guid,]) %>%
+  median_qi() |>
+  separate_wider_delim(t_guid, delim = "_",
+                       names = c("t","guid"),
+                       cols_remove = T) |>
+  mutate(t = as.numeric(t)) -> summ_t_guid
+  
+summ_t_guid |> 
+  ggplot(aes(t, .value, ymin = .lower, ymax = .upper, group = guid)) + 
+  geom_ribbon(alpha = 0.002) +
+  geom_line(alpha = 0.1) + 
+  ylim(-1,1) +
+  labs(x = "Month", y = "Posterior estimate", 
+       subtitle = "Month:district random effect") -> p_tguid_iid
+
+p_tguid_iid
+
+p_season + (p_t_iid / p_tguid_iid) + plot_annotation(tag_levels = "A")
+
+ggsave("./figures/final fit/temp_re.png", 
+       height = 5, width = 10, bg = "white")
+```
+
+## Extract and plot predictions
+
+```{r}
+
+y <- epred_draws(fit_final,
+                 newdata = fitdata)
+
+y |> 
+  median_qi(.epred) -> y_summ
+
+```
+
+### Over time
+
+```{r}
+
+y_summ |> 
+  group_by(month) |> 
+  summarise(across(c(n_npafp, n_npev, .epred, .lower, .upper), sum)) |> 
+  ungroup() |> 
+  mutate(across(n_npev:.upper,\(x) x/n_npafp)) |> 
+  ggplot(aes(month, .epred)) +
+    geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2) +
+    geom_line(lwd = 0.2) + 
+    geom_line(aes(y = n_npev), lty = "dashed", col = "indianred") +
+  labs(x = NULL, y = "Estimated prevalence") -> p_pred_mth
+  
+y_summ |> 
+  group_by(adm1_name, month) |> 
+  summarise(across(c(n_npafp, n_npev, .epred, .lower, .upper), sum)) |> 
+  ungroup() |> 
+  mutate(across(n_npev:.upper,\(x) x/n_npafp)) |> 
+  ggplot(aes(month, .epred, col = adm1_name, fill = adm1_name)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2, col = NA) +
+  geom_line(lwd = 0.2) + 
+  geom_line(aes(y = n_npev), lty = "dashed") +
+  scale_colour_viridis_d(option = "turbo") +
+  scale_fill_viridis_d(option = "turbo") +
+  facet_wrap(~adm1_name, scale = "free_y") +
+  guides(col = "none", fill = "none") +
+  labs(col = "Province", x = NULL, y = "Estimated prevalence") -> p_pred_prov
+
+p_pred_mth + p_pred_prov + plot_layout(widths = c(1,2)) + 
+  plot_annotation(tag_levels = "A")
+ggsave("figures/final fit/pred_prev_time.png",
+       height = 5, width = 12, bg = "white")
+  
+```
+
+### Over space
+
+Set one NP-AFP case per district-month to predict prevalence in (0,1)
+ 
+```{r}
+
+newdata <- fitdata
+
+newdata$n_npafp_obs <- newdata$n_npafp
+newdata$n_npafp <- 1
+
+# Extract predictions
+pred_prev <- epred_draws(fit_final,
+                 newdata = newdata,
+                 re_formula = NULL)
+
+# Summarise 
+pred_summ <- pred_prev |> 
+  group_by(.row) |> 
+  summarise(pred_mean = mean(.epred),
+            pred_sd = sd(.epred),
+            pred_median = median(.epred),
+            pred_lo = quantile(.epred, 0.025),
+            pred_hi = quantile(.epred, 0.975)) |> 
+  ungroup() 
+
+preddata <- newdata |> 
+  bind_cols(pred_summ) |> 
+  mutate(across(starts_with("pred"),\(x) x/n_npafp)) 
+ 
+# Summarise by district
+pred_summ <- pred_prev |> 
+  group_by(.row) |> 
+  summarise(pred_mean = mean(.epred),
+            pred_sd = sd(.epred),
+            pred_median = median(.epred),
+            pred_lo = quantile(.epred, 0.025),
+            pred_hi = quantile(.epred, 0.975)) |> 
+  ungroup() 
+
+preddata <- newdata |> 
+  bind_cols(pred_summ)
+
+```
+
+## Plotting
+
+### By month and district
+
+```{r}
+
+preddata |> 
+  ggplot(aes(month, group = guid)) + 
+  geom_jitter(aes(y = npev_npafp_p), 
+             col = "grey", alpha = 0.5, cex = 0.2) +
+  geom_ribbon(aes(ymin = pred_lo, ymax = pred_hi), 
+              alpha = 0.2, fill = "lightsteelblue") + 
+  geom_line(aes(y = pred_median), alpha = 0.2, col = "steelblue4") + 
+  # geom_line(aes(y = pred_mean), col = "red", alpha = 0.1) +
+  labs(y = "Estimated prevalence", x = "Month", title= "Predicted median & 95% quantile interval")
+
+preddata |> 
+  ggplot(aes(month, group = guid)) + 
+  geom_jitter(aes(y = npev_npafp_p), 
+             col = "grey", alpha = 0.5, cex = 0.2) +
+  geom_ribbon(aes(ymin = pred_mean - 1.96*pred_sd, ymax = pred_mean + 1.96*pred_sd), 
+              alpha = 0.2, fill = "lightsteelblue") + 
+  geom_line(aes(y = pred_mean), alpha = 0.2, col = "steelblue4") + 
+  # geom_line(aes(y = pred_mean), col = "red", alpha = 0.1) +
+  labs(y = "Estimated prevalence", x = "Month", title= "Predicted mean & 95% gaussian interval")
+
+```
+### Annual averages
+
+```{r}
+
+preddata |> 
+   group_by(guid, year) |> 
+   summarise(pred_mean = mean(pred_mean),
+             pred_sd = mean(pred_sd)) |>
+   ungroup() |>
+   right_join(shape2) -> tmp
+
+tmp |> 
+ ggplot(aes(fill = pred_mean, geometry = SHAPE)) + 
+   geom_sf(col = NA) +
+   facet_wrap(~year) +
+   scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence") + 
+  theme_void() -> p_pred_yr
+p_pred_yr
+
+ggsave("figures/final fit/pred_dist_yr.png",
+       height = 6, width = 10, bg = "white")
+
+tmp |> 
+  ggplot(aes(fill = pred_sd, geometry = SHAPE)) + 
+   geom_sf(col = NA) +
+   facet_wrap(~year) +
+    scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence (SD)") + 
+    theme_void() -> p_pred_yr_sd
+p_pred_yr_sd
+
+```
+
+### Monthly
+
+Look at spatial trends every other month, across years.
+ 
+```{r}
+
+preddata |> 
+  filter(period %% 0.125 == 0) |>
+  right_join(shape2) -> tmp
+
+tmp |> 
+  ggplot(aes(fill = pred_mean, geometry = SHAPE)) + 
+    geom_sf(col = NA) +
+    facet_wrap(~month) +
+    scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence") + 
+      theme_void() -> p_pred_mth
+p_pred_mth
+
+ggsave("figures/final fit/pred_dist_mth.png",
+       height = 6, width = 10, bg = "white")
+
+
+tmp |> 
+  ggplot(aes(fill = pred_sd, geometry = SHAPE)) + 
+    geom_sf(col = NA) +
+    facet_wrap(~month) +
+    scale_fill_viridis_c(name = "Predicted NPEV+\nPrevalence (SD)") + 
+    theme_void() -> p_pred_mth_sd
+p_pred_mth_sd
+
+
+```
+
+Save stan code and data with predicted mean/SD per month/district:
+
+```{r}
+
+stan_final <- stancode(fit_final)
+cmdstanr::write_stan_file(stan_final,
+                          dir = here("stan"),
+                          basename = "district_prev_final.stan")
+
+saveRDS(preddata, "output/pred_prev_npev.rds")
+
+```

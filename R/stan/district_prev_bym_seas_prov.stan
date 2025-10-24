@@ -8,6 +8,9 @@ data {
   int<lower=1> K;  // number of population-level effects
   matrix[N, K] X;  // population-level design matrix
   int<lower=1> Kc;  // number of population-level effects after centering
+  // data for splines
+  int Ks;  // number of linear effects
+  matrix[N, Ks] Xs;  // design matrix for the linear effects
   // data for spline 1
   int nb_1;  // number of bases
   array[nb_1] int knots_1;  // number of knots
@@ -43,6 +46,11 @@ data {
   array[nb_7] int knots_7;  // number of knots
   // basis function matrices
   matrix[N, knots_7[1]] Zs_7_1;
+  // data for spline 8
+  int nb_8;  // number of bases
+  array[nb_8] int knots_8;  // number of knots
+  // basis function matrices
+  matrix[N, knots_8[1]] Zs_8_1;
   // data for the CAR structure
   int<lower=1> Nloc;
   array[N] int<lower=1> Jloc;
@@ -64,6 +72,7 @@ transformed data {
 parameters {
   vector[Kc] b;  // regression coefficients
   real Intercept;  // temporary intercept for centered predictors
+  vector[Ks] bs;  // unpenalized spline coefficients
   // parameters for spline 1
   // standardized penalized spline coefficients
   vector[knots_1[1]] zs_1_1;
@@ -92,13 +101,16 @@ parameters {
   // standardized penalized spline coefficients
   vector[knots_7[1]] zs_7_1;
   vector<lower=0>[nb_7] sds_7;  // SDs of penalized spline coefficients
+  // parameters for spline 8
+  // standardized penalized spline coefficients
+  vector[knots_8[1]] zs_8_1;
+  vector<lower=0>[nb_8] sds_8;  // SDs of penalized spline coefficients
   real<lower=0> sdcar;  // SD of the CAR structure
   // parameters for the BYM2 structure
   vector[Nloc] zcar;  // spatial part
   vector[Nloc] nszcar;  // non-spatial part
   // proportion of variance in the spatial part
   real<lower=0,upper=1> rhocar;
-  real<lower=0> sigma_w;  // Random walk SD
 }
 transformed parameters {
   // penalized spline coefficients
@@ -115,6 +127,8 @@ transformed parameters {
   vector[knots_6[1]] s_6_1;
   // penalized spline coefficients
   vector[knots_7[1]] s_7_1;
+  // penalized spline coefficients
+  vector[knots_8[1]] s_8_1;
   // scaled parameters for the BYM2 structure
   vector[Nloc] rcar;
   real lprior = 0;  // prior contributions to the log posterior
@@ -134,6 +148,8 @@ transformed parameters {
   s_6_1 = sds_6[1] * zs_6_1;
   // compute penalized spline coefficients
   s_7_1 = sds_7[1] * zs_7_1;
+  // compute penalized spline coefficients
+  s_8_1 = sds_8[1] * zs_8_1;
   lprior += student_t_lpdf(Intercept | 3, 0, 2.5);
   lprior += student_t_lpdf(sds_1 | 3, 0, 2.5)
     - 1 * student_t_lccdf(0 | 3, 0, 2.5);
@@ -149,6 +165,8 @@ transformed parameters {
     - 1 * student_t_lccdf(0 | 3, 0, 2.5);
   lprior += student_t_lpdf(sds_7 | 3, 0, 2.5)
     - 1 * student_t_lccdf(0 | 3, 0, 2.5);
+  lprior += student_t_lpdf(sds_8 | 3, 0, 2.5)
+    - 1 * student_t_lccdf(0 | 3, 0, 2.5);
   lprior += student_t_lpdf(sdcar | 3, 0, 2.5)
     - 1 * student_t_lccdf(0 | 3, 0, 2.5);
   lprior += beta_lpdf(rhocar | 1, 1);
@@ -158,7 +176,7 @@ model {
   if (!prior_only) {
     // initialize linear predictor term
     vector[N] mu = rep_vector(0.0, N);
-    mu += Intercept + rw + Xc * b + Zs_1_1 * s_1_1 + Zs_2_1 * s_2_1 + Zs_3_1 * s_3_1 + Zs_4_1 * s_4_1 + Zs_5_1 * s_5_1 + Zs_6_1 * s_6_1 + Zs_7_1 * s_7_1;
+    mu += Intercept + Xc * b + Xs * bs + Zs_1_1 * s_1_1 + Zs_2_1 * s_2_1 + Zs_3_1 * s_3_1 + Zs_4_1 * s_4_1 + Zs_5_1 * s_5_1 + Zs_6_1 * s_6_1 + Zs_7_1 * s_7_1 + Zs_8_1 * s_8_1;
     for (n in 1:N) {
       // add more terms to the linear predictor
       mu[n] += rcar[Jloc[n]];
@@ -174,19 +192,16 @@ model {
   target += std_normal_lpdf(zs_5_1);
   target += std_normal_lpdf(zs_6_1);
   target += std_normal_lpdf(zs_7_1);
+  target += std_normal_lpdf(zs_8_1);
   // improper prior on the spatial BYM2 component
   target += -0.5 * dot_self(zcar[edges1] - zcar[edges2]);
   // soft sum-to-zero constraint
   target += normal_lpdf(sum(zcar) | 0, 0.001 * Nloc);
   // proper prior on the non-spatial BYM2 component
   target += std_normal_lpdf(nszcar);
-  // Random walk prior
-  rw[1] ~ normal(0, 1);
-  for(t in 2:N) {
-    rw[t] ~ normal(rw[t-1], sigma_w);
-  }
 }
 generated quantities {
   // actual population-level intercept
-  real b_Intercept = Intercept + rw - dot_product(means_X, b);
+  real b_Intercept = Intercept - dot_product(means_X, b);
 }
+
