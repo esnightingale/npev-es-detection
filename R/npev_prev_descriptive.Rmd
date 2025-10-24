@@ -1,20 +1,12 @@
 ---
 title: 'Part 1: District NPEV prevalence'
-subtitle: 'Descriptive summary'
+subtitle: '1A: Descriptive'
 output:
   html_document:
     df_print: paged
 ---
 
 ```{r}
-
-library(devtools)
-if(!require(cmdstanr)){
-  devtools::install_github("stan-dev/cmdstanr", dependencies=c("Depends", "Imports"))
-}
-if(!require(INLA)){
-install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
-}
 
 pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
 theme_set(theme_minimal())
@@ -26,7 +18,6 @@ data <- readRDS(here(dir, "afp_analysis.rds"))
 
 # Shapefiles and adjacency matrix
 shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
-W <- readRDS(here(dir,"W.rds"))
 
 ```
 
@@ -98,7 +89,63 @@ data |>
   geom_sf(col = NA) +
   facet_wrap(~year) +
   scale_fill_viridis_c(name = "NPEV+\nPrevalence", trans = "sqrt") + 
-  theme_void() -> p_obs_dist_yr
+  theme_void() -> p_dist_yr
+
+
+# Longer term trend, by province
+data |> 
+  group_by(month, adm1_name) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = month, y = r_npev, 
+             group = adm1_name, col = adm1_name, fill = adm1_name)) + 
+  # geom_jitter(alpha = 0.2) + 
+  geom_smooth(alpha = 0.3) + 
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_mth_prov
+
+# Correlation with population density
+data |> 
+  group_by(guid_pop_dens, guid) |> 
+  summarise(n_npafp = sum(n_npafp),
+            n_npev = sum(n_npev),
+            r_npev = n_npev/n_npafp) |>
+  ungroup() |>
+  ggplot(aes(x = as.numeric(guid_pop_dens), y = r_npev)) + 
+  geom_jitter(alpha = 0.2) +
+  geom_smooth(alpha = 0.1, lwd = 0.2, se = T) + 
+  scale_x_continuous(trans = "log10") +
+  labs(x = "Log population density (/km2)", y = "NPEV+ Prevalence") -> p_dens_dist
+
+p_afp_rates
+p_pvpos
+p_mth_prov
+p_dens_dist
+
+```
+
+Seasonal trends
+```{r}
+
+# Seasonal trend, overall
+data |> 
+  group_by(month_of_year) |> 
+  summarise(n_npafp = sum(n_npafp),
+            `NPEV+` = sum(n_npev),
+            `NPEV-` = n_npafp - `NPEV+`,
+            p_npev = `NPEV+`*100/n_npafp) |>
+  ungroup() |> 
+  pivot_longer(`NPEV+`:`NPEV-`) |>
+  ggplot() + 
+  geom_col(aes(x = month_of_year, y = value,  fill = name)) +
+  geom_line(aes(x = month_of_year, y = p_npev*150, group = 1)) +
+  scale_y_continuous(name = "Notified NP-AFP cases",
+                     sec.axis = sec_axis(trans=~./150,
+                                         name = "% positive")) +
+  theme(legend.position = c(0.1,0.9)) +
+  scale_fill_manual(values = c("grey","indianred")) +
+  labs(x = "Paralysis onset month", y = "Count", fill = NULL) -> p_moy
 
 # Seasonal trend, by year
 data |> 
@@ -116,7 +163,7 @@ data |>
   theme(legend.position = c(0.1,0.9)) +
   # guides(fill = "none") +
   ylim(0,100) +
-  labs(x = "Paralysis onset month", y = "% Positive", col = "Year", fill = "Year") -> p_obs_mth_yr
+  labs(x = "Paralysis onset month", y = "% Positive", col = "Year", fill = "Year") -> p_moy_yr
 
 # Seasonal trend, by province
 data |> 
@@ -129,7 +176,7 @@ data |>
              group = adm1_name, col = adm1_name, fill = adm1_name)) + 
   # geom_jitter(alpha = 0.2) + 
   geom_smooth(alpha = 0.5) + 
-  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_prov
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_moy_prov
 
 # Seasonal trend, by district
 data |> 
@@ -144,48 +191,40 @@ data |>
   geom_smooth(alpha = 0.1, lwd = 0.2, se = F, 
               col = "steelblue") + 
   theme(axis.text.x = element_text(angle = 45)) +
-  labs(x = NULL, y = "NPEV+ Prevalence") -> p_obs_mth_dist
+  labs(x = NULL, y = "NPEV+ Prevalence") -> p_moy_dist
 
-# Correlation with population density
-data |> 
-  group_by(guid_pop_dens, guid) |> 
-  summarise(n_npafp = sum(n_npafp),
-            n_npev = sum(n_npev),
-            r_npev = n_npev/n_npafp) |>
-  ungroup() |>
-  ggplot(aes(x = as.numeric(guid_pop_dens), y = r_npev)) + 
-  geom_jitter(alpha = 0.2) +
-  geom_smooth(alpha = 0.1, lwd = 0.2, se = T) + 
-  scale_x_continuous(trans = "log10") +
-  labs(x = "Log population density (/km2)", y = "NPEV+ Prevalence") -> p_obs_dens_dist
 
-p_afp_rates
-p_pvpos
-
-p_obs_mth_yr
-p_obs_dist_yr
-p_obs_mth_prov
-p_obs_mth_dist
-p_obs_dens_dist
+p_moy
+p_moy_yr
+p_moy_prov
+p_moy_dist
 
 ```
 
 Overall decrease year on year, with more pronounced seasonality in 2021. 
 
+```{r}
+
+p_moy + p_moy_yr + 
+  plot_annotation(tag_levels = "A")
+
+ggsave(here("figures/descriptive/afp/npev_time.png"),
+       height = 4, width = 10, bg = "white")
+
+```
+
 ## Figure 1
 
 ```{r}
 
-p_obs_mth_yr
-ggsave("./figures/descriptive/afp/npev_season_yr.png", 
-       bg = "white",
-       height = 4, width = 5, units = "in")
-
 (p_afp_rates + p_pvpos)/
-  (p_obs_dist_yr + p_obs_mth_dist) +
+  (p_dist_yr + p_moy_dist) +
   plot_annotation(tag_levels = "A")
 ggsave("./figures/descriptive/afp/Figure_1.png", 
        bg = "white",
        height = 6, width = 8, units = "in")
 
 ```
+
+################################################################################
+################################################################################
