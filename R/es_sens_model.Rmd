@@ -28,16 +28,17 @@ pacman::p_load(tidyverse, lubridate, here, janitor, gtsummary, sf, spdep,
                rstan, brms, tidybayes, bayesplot, units, loo, patchwork)
 theme_set(theme_minimal())
 
-rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
-
 dir <- "data/Pakistan/analysis"
+outdir <- "output/detection"
+figdir <- "figures/es model"
 
 # source("./utils/fit_npafp_model.R")
 source(here("R/utils/check_model_fit.R"))
 
 # NP-AFP analysis data with predicted NPEV prevalence (BYM2 + IID(time*guid) + season)
-npev_prev <- readRDS(here("output/pred_prev_npev.rds")) 
+npev_prev <- readRDS(here("output/pred_prev_npev.rds")) |> 
+  rename(pred_mean = pred_p,
+         pred_sd = sd_p)
 
 # ES data
 es <- readRDS(here(dir, "es_analysis.rds"))
@@ -67,36 +68,46 @@ Characteristics to consider:
  * % urban within radius?
  * % surface water within radius?
 
-First join district shapes to NPEV prevalence data:
-
+Join district shapes to NPEV prevalence data: 
 ```{r}
 
 npev_dist <- shape2 |> 
   select(guid) |> 
   full_join(npev_prev)
 
-# Test plots
-npev_dist |> 
-  filter(period == 2021) |> 
-  ggplot(aes(fill = npev_npafp_p)) + 
-  geom_sf() + 
-  scale_fill_viridis_c("Observed\nNPEV prevalence") + 
-  labs(alpha = "No. NP-AFP")
-npev_dist |> 
-  filter(period == 2021) |> 
-  ggplot(aes(fill = npev_npafp_p, alpha = n_npafp_obs)) + 
-  geom_sf() + 
-  scale_fill_viridis_c("Observed\nNPEV prevalence") + 
-  labs(alpha = "No. NP-AFP")
-npev_dist |> 
-  filter(period == 2021) |> 
-  ggplot(aes(fill = pred_mean)) + 
-  geom_sf() + 
-  scale_fill_viridis_c("Predicted\nNPEV prevalence", limits = c(0,0.5))
-
 ```
 
-Aggregate samples to month and define time variables for samples to match prevalence predictions, and define a minimum number of samples to exclude low power sites:
+### Test plots
+Check obs and pred prevalence with some aggregated maps:
+```{r}
+
+plotdat <- npev_dist |> 
+  group_by(guid) |> 
+  summarise(npev_npafp_p = mean(npev_npafp_p),
+            n_npafp = sum(n_npafp),
+            pred_mean = mean(pred_mean)) |> 
+  ungroup() 
+
+plotdat |> 
+  ggplot(aes(fill = npev_npafp_p)) + 
+  geom_sf() + 
+  scale_fill_viridis_b("Observed\nNPEV prevalence") + 
+  labs(alpha = "No. tested")
+plotdat |> 
+  st_centroid() |> 
+  ggplot(aes(col = npev_npafp_p, size = n_npafp)) + 
+  geom_sf(data = shape2, fill = NA, inherit.aes = F) +
+  geom_sf() + 
+  scale_colour_viridis_c("Observed\nNPEV prevalence") + 
+  labs(size = "No. tested")
+plotdat |> 
+  ggplot(aes(fill = pred_mean)) + 
+  geom_sf() + 
+  scale_fill_viridis_c("Predicted\nNPEV prevalence")
+
+```
+## Site exclusion
+Define a minimum number of samples to exclude low power sites:
 
 ```{r}
 
@@ -109,6 +120,7 @@ es |>
 
 included_sites <- unique(es$site_id[es$incl_site])
 length(included_sites)
+
 ```
 
 ## Joins
@@ -126,7 +138,9 @@ tabyl(es$guid) |>
 
 # Join by this existing guid
 tmp <- es |> 
-   left_join(npev_prev |> select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
+   left_join(npev_prev |> 
+               mutate(guid = guid_old) |> 
+               select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
    select(guid, guid_pop_dens, site_id:coord_imp, catchment_pop_5k, catchment_cat_5k, 
           year, month, month_of_year, 
           pred_mean, pred_sd, everything())
@@ -135,7 +149,7 @@ summary(tmp$pred_mean)
 
 ```
 
-Seems some of the existing guids don't appear in predicted data? Re-do this link:
+Seems some of the existing sample guids don't appear in district data? Re-do this link:
 
 ```{r}
 
@@ -144,14 +158,18 @@ sites_dist_xy <- sites |>
   st_join(select(shape2, guid), st_within) |> 
   st_drop_geometry()
 
+# Pivot built area by year for later join
+sites_dist_xy_long <- sites_dist_xy |> pivot_longer(starts_with("built"), 
+                                          names_prefix = "built",
+                                          names_transform = \(x) as.numeric(x)+2000,
+                                          names_to = "year",
+                                          values_to = "built")
+
 ```
-
-
-Missing values corrected.
 
 ### 2. By 5km radius
 
-First define buffer around unique sites and intersect with districts:
+First intersect sites buffer with districts:
 
 ```{r}
 
@@ -169,6 +187,12 @@ catch_5k_dist_max <- catch_5k_dist |>
   group_by(site_id) |> 
   mutate(area_p = as.numeric(area/sum(area))) |>
   slice_max(order_by = area_p) 
+
+catch_5k_dist_max_long <- catch_5k_dist_max |> pivot_longer(starts_with("built"), 
+                                          names_prefix = "built",
+                                          names_transform = \(x) as.numeric(x)+2000,
+                                          names_to = "year",
+                                          values_to = "built")
 
 catch_5k_dist_max |> 
   mutate(area_p = cut(area_p, c(0,.5,.6,.7,.8,.9,1))) |> 
@@ -223,14 +247,18 @@ catch_wsh_dist_max <- catch_wsh_dist |>
   mutate(area_p = as.numeric(area/sum(area))) |>
   slice_max(order_by = area_p) 
 
+catch_wsh_dist_max_long <- catch_wsh_dist_max |> pivot_longer(starts_with("built"), 
+                                          names_prefix = "built",
+                                          names_transform = \(x) as.numeric(x)+2000,
+                                          names_to = "year",
+                                          values_to = "built")
+
 catch_wsh_dist_max |> 
   mutate(area_p = cut(area_p, c(0,.5,.6,.7,.8,.9,1))) |> 
   janitor::tabyl(area_p)
 
 ```
 Distribution of district area coverage seems bimodal here - what does that mean?
-
-
 
 # Link sites to districts
 
@@ -241,14 +269,17 @@ Link ES samples to NPEV prevalence by (1) site coords / (2) majority 5k catchmen
 es |> 
   # Drop existing guid
   select(-guid) |> 
-  left_join(sites_dist_xy) |> 
+  left_join(sites_dist_xy_long) |>
   left_join(npev_prev |> select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
-  select(guid, guid_pop_dens, site_id:coord_imp, catchment_pop_5k, catchment_cat_5k, year, month, pred_mean, pred_sd, everything()) -> es_npev_xy
+  select(guid, guid_pop_dens, site_id:coord_imp, 
+         catchment_pop_5k, catchment_cat_5k, precip21, built,
+         year, month, 
+         pred_mean, pred_sd, everything()) -> es_npev_xy
 
 es |> 
   # Drop existing guid
   select(-guid) |> 
-  left_join(catch_5k_dist_max) |> 
+  left_join(catch_5k_dist_max_long) |> 
   left_join(npev_prev |> select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
   select(guid, guid_pop_dens, site_id:coord_imp, catchment_pop_5k, catchment_cat_5k, 
          year, month,
@@ -258,7 +289,7 @@ es |>
 # es |> 
 #   # Drop existing guid
 #   select(-guid) |> 
-#   left_join(catch_wsh_dist_max) |> 
+#   left_join(catch_wsh_dist_max_long) |> 
 #   left_join(npev_prev |> select(guid, year, month, guid_pop_dens, pred_mean, pred_sd)) |> 
 #   select(guid, guid_pop_dens, site_id:coord_imp, catchment_pop_5k, catchment_cat_5k, 
 #          year, month,
@@ -272,9 +303,48 @@ summary(es_npev_5k$pred_mean)
 # summary(es_npev_wsh$pred_mean)
 
 ```
+How different are st_within and st_buffer joins?
 
+```{r}
+
+# For each site, how often is the matched district the same?
+
+es_npev_xy |> 
+  select(site_id, guid) |> distinct() |> 
+  full_join(select(es_npev_5k, site_id, guid) |> distinct(), by = "site_id") |> 
+  mutate(match = guid.x==guid.y) -> match_comp
+
+mean(match_comp$match)
+
+```
+
+Very little difference between these two definitions (since majority of 5k buffers fall within one district, same as site location).
+Continue with xy join.
 
 ### Crude correlation
+
+```{r}
+
+es_npev_xy |> 
+  group_by(month, guid, pred_mean, pred_sd) |> 
+  summarise(n_samp = n(),
+            n_npev = sum(!is.na(npev)),
+            p_npev = n_npev/n_samp) |> 
+  arrange(n_samp) |> 
+  ggplot(aes(p_npev, col = n_samp, size = n_samp,
+             y = pred_mean)) + 
+  geom_abline() +
+  geom_jitter(alpha = 0.7) + 
+  guides(size = "none") +
+  scale_colour_viridis_b() + 
+  labs(x = "Total ES positivity (across sites, per district/month)",
+       y = "Predicted prevalence",
+       col = "No. samples") + 
+  theme(legend.position = c(0.85,0.8), legend.background = element_rect(fill = "white"))
+ggsave(here(figdir,"es_prev_scatter.png"),
+       height = 6, width = 10, bg = "white")
+
+```
 
 Rates of NPEV detection at sites given predicted underlying prevalence, by month and year:
 
@@ -297,7 +367,6 @@ es_npev_xy |>
        x = NULL)
 
 ```
-Very little difference between these two definitions (since majority of 5k buffers fall within one district, same as site location).
 
 ```{r}
 
@@ -341,7 +410,7 @@ Then explore adding season of collection, site type and catchment population siz
 Investigate: 
 + Random slope with prevalence by site
 + Interaction prevalence and site type
-+ Interaction prevalence and season
++ Interaction prevalence and season (?)
 
 Questions:
 Are samples from different sites differentially associated with underlying prevalence?
@@ -352,19 +421,22 @@ Does [site type/season] modify the strength of association between detection and
 ```{r}
 
 fitdata <- es_npev_xy |> 
+  filter(!pv) |> 
   mutate(y = as.numeric(!is.na(npev)),
          t = as.numeric(as.factor(month)),
-         month_of_year = as.factor(as.numeric(month_of_year)),
+         moy = as.factor(as.numeric(month_of_year)),
          year_f = factor(year),
-         dist_t_id = paste(guid,t,":"),
          season = as.factor(lubridate::quarter(month)),
-         log_pop_5k = log(catchment_pop_5k))
+         log_pop_5k = log(catchment_pop_5k),
+         log_pop_5k_s = scale(log_pop_5k),
+         built_s = scale(built),
+         precip_s = scale(precip21))
 
 site_ids <- unique(fitdata$site_id)
 
 ```
 
-Baseline model with site- and time-specific random intercept:
+Baseline model with site- and time-specific random intercepts:
 - How much variability is there in NPEV detection across sites and time?
 
 ```{r}
@@ -384,7 +456,7 @@ pp_base <- brm(f_base,
                prior = prior_base,
                sample_prior = "only",
                file_refit = "on_change",
-               file = here("output/pp_es_base.rds"))
+               file = here(outdir,"pp_es_base.rds"))
 
 ```
 First check priors:
@@ -413,7 +485,7 @@ fit_base <- brm(f_base,
                control = list(adapt_delta = 0.96),
                save_pars = save_pars(all = T),
                file_refit = "on_change",
-               file = here("output/fit_es_base.rds"))
+               file = here(outdir,"fit_es_base.rds"))
 
 ```
 
@@ -467,14 +539,16 @@ summ_iid_t |>
   theme(axis.text.x = element_blank())
 
 ```
-Shift in detection across provinces (e.g. Punjab overall higher).
-Different variability in sites between provinces. 
+Shift in detection across provinces
+ - Punjab overall higher
+ - Baloch. and Sindh more consistency across sites?
+   -> This is because of all those singletons - no information to deviate from the average
+ 
 Indication of seasonal trend and decline in detection since ~2023.
 
 ## Adjusting for district prevalence
 
-### Measurement error
-
+### Independent of site
 How much of the above temporal variability is explained by underlying (seasonal) prevalence?
 - Note the same time indices between ES / prevalence while spatial indices are different.
 ```{r}
@@ -506,9 +580,8 @@ summary(fit1)
 bayes_R2(fit1)
 ```
 
-Accounting for correlation between samples from the same site, there does appear to be an overall positive association between predicted prevalence and probability of ES detection.
-- To what extent does this correlation vary between sites? Could this variability be masking the effect?
-
+Accounting for correlation between samples from the same site, there is an overall positive association between predicted prevalence and probability of ES detection (quite significantly so).
+ - To what extent does this correlation vary between sites? 
 
 ```{r}
 
@@ -519,23 +592,25 @@ fit1 %>%
   arrange(admin_1, site_id) |> 
   mutate(id = row_number()) -> summ_iid_site2
 
+# Redo this figure connecting site points - i.e. add link from unadjusted-adjusted (probably remove CIs)
 summ_iid_site |> 
   mutate(grp = "Unadjusted") |> 
   bind_rows(mutate(summ_iid_site2, grp = "Adjusted")) |> 
   ggplot(aes(id, .value,
              ymin = .lower, ymax = .upper,
-             col = admin_1, alpha = grp)) + 
+             col = grp)) + 
   geom_hline(yintercept = 0, col = "grey") +
   geom_pointrange(lwd = 0.5, position = position_dodge2(width = 10)) + 
   labs(x = "Site", y = "Posterior estimate", col = "Province",
        alpha = NULL,
        subtitle = "Site-specific intercept") +
-  scale_colour_manual(values = pal_prov) + 
+  # scale_colour_manual(values = pal_prov) + 
   theme(axis.text.x = element_blank())
 
 ```
 
-Adding a site-specific prevalence slope:
+### Site-specific slope
+
 ```{r}
 
 f2 = bf(y ~ 0 + (1 + me(pred_mean, pred_sd, gr = dist_t_id) | site_id))
@@ -563,7 +638,9 @@ fit2 <- update(fit_base,
 summary(fit2)
 bayes_R2(fit2)
 ```
-No correlation estimated between site-specific intercepts and slopes.
+No correlation estimated between site-specific intercepts and slopes. Very little variability between slopes. 
+
+Plot these random slopes...
 
 ```{r}
 
@@ -670,6 +747,41 @@ mcmc_areas(fit1,
 
 ```
 
+## Adjusting for site characteristics
+
+```{r}
+
+f3 = bf(y ~ 0 + log_pop_5k_s + built_s + precip_s +
+          me(pred_mean, pred_sd, gr = dist_t_id) +
+          (1 | site_id))
+  
+# Respecify priors to be more informative
+prior3 <- c(prior(normal(0,1), class = b),
+                prior(exponential(2), class = sd),
+                prior(normal(0,1), class = meanme),
+                prior(exponential(2), class = sdme)
+                )
+
+```
+
+```{r}
+
+fit3 <- update(fit1,
+               formula = f3, 
+               newdata = fitdata,
+               prior = prior3,
+               recompile = T,
+               file_refit = "on_change",
+               file = here("output/fit_es_3.rds")) 
+
+```
+
+```{r}
+summary(fit3)
+bayes_R2(fit3)
+```
+
+# Still working on...
 
 ## Differential district prevalence effect by season
 
