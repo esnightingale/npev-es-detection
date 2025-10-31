@@ -27,26 +27,38 @@ proj_local <- "EPSG:32642"
 # ----- #
 
 # Read input data
-## AFP case records
+
+## Surveillance data
+### AFP case records
 afp_ = read_csv(filename_afp) |> 
   filter(between(month, tp[1], tp[2]))
 
-## Environmental surveillance sample records 
+### Environmental surveillance sample records 
 es_ = read_csv(filename_es) |> 
   filter(between(month, tp[1], tp[2]))
 
-## NPAFP indicator for denominators
+### NPAFP indicator for denominators
 npafp_ind <- read_csv(filename_npafp) |> 
   filter(between(month, tp[1], tp[2]))
 
-## District shapefiles
+## Spatial data
+### District shapefiles
 shape2 <- readRDS(here(dir,"shape2.rds")) 
 
-## Population raster
-poprast <- rast(here(dir,"pak_ppp_2020_UNadj_constrained.tif")) 
+### Population raster
+poprast <- rast(here(dir,"WorldPop","pak_ppp_2020_UNadj_constrained.tif")) 
 
-## Novel-T watersheds
+### Novel-T watersheds
 catch_wsh <- readRDS(here(dir,"analysis", "watershed.rds"))
+
+### Annual mean precipitation https://hub.worldpop.org/doi/10.5258/SOTON/WP00772 
+rain <- rast(here(dir,"WorldPop","pak_ppt_2021_yravg_tc_100m_v1.tif"))
+
+### Built up surface https://hub.worldpop.org/doi/10.5258/SOTON/WP00772 
+f <- list.files(here(dir, "WorldPop"), 
+                full.names = T,
+                pattern = "pak_built_S_GHS_U_wFGW_100m_v1_")
+built <- rast(f)
 
 ################################################################################
 # Set up data for analysis ------------------------------------------------
@@ -54,9 +66,12 @@ catch_wsh <- readRDS(here(dir,"analysis", "watershed.rds"))
 # Shapefiles --------------------------------------------------------------
 
 ## Projected data
-poprast_proj <- project(poprast, proj_local)
 shape2_proj <- st_transform(shape2, proj_local) 
+poprast_proj <- project(poprast, proj_local)
+rain_proj <- project(rain, proj_local)
+built_proj <- project(built, proj_local) 
 
+# Define district area in km2
 shape2$shape_area_km2  <- st_area(shape2_proj) |> units::set_units("km^2")
 hist(shape2$shape_area_km2)
 summary(shape2$shape_area_km2)
@@ -66,6 +81,7 @@ shape2$guid_total_pop <- exactextractr::exact_extract(poprast_proj,
                                                  shape2_proj, 
                                                  fun = "sum") 
 
+# Define district population density
 shape2$guid_pop_dens <- shape2$guid_total_pop/shape2$shape_area_km2
 hist(shape2$guid_pop_dens)  
 summary(shape2$guid_pop_dens)
@@ -78,23 +94,21 @@ summary(shape2$guid_pop_dens)
 #                        labels = scales::comma) +
 #   theme_void()
 
-# Define spatial adjacency matrix (for BYM model)
-## Create neighbors list 
-nb <- spdep::poly2nb(shape2)  
-
-## Convert to adjacency matrix
-W <- spdep::nb2mat(nb, style = "B", zero.policy = TRUE) |> as.matrix() 
-
-## Set rownames to district names
-rownames(W) <- shape2$guid 
-
 # AFP data ----------------------------------------------------------------
 
 afp <- afp_ |> 
   # Distinguish polio and non-polio cases
   mutate(npafp = !(grepl("WILD", virus_type_s) | grepl("VDPV",virus_type_s))) |> 
   # exclude AFP among over-15s 
-  filter(age_m < 15*12) |>
+  filter(age_m < 15*12) 
+
+# # Check NPAFP data has all districts/months:
+# tmp <- expand.grid(
+#     district = levels(npafp_ind$guid),
+#     month_index = 1:12
+#   )
+
+afp_agg <- afp |>
   # Aggregate to district and month
   group_by(guid, month) |> 
   summarise(n_afp = n(),
@@ -175,9 +189,153 @@ sites <- es |>
   ungroup() |> 
   st_as_sf(coords = c("x","y"), crs = 4326, remove = F) 
 
+# Define consistency class ------------------------------------------------
+
+# Consider:
+# + Ad-hoc sites at least 6m old but only sampled for a short period
+# + Established regularly sampled sites, at least 1 sample/month for the time period
+# + Newer regularly sampled sites, at least 1 sample per month since 2023
+
+# First plot out all sites in the dataset
+ggplot(es, aes(collection_date, site_id, col = as.numeric(site_id))) +
+  geom_point() + 
+  theme(axis.text.y = element_blank()) + 
+  scale_colour_viridis_c() + 
+  guides(col = "none") +
+  labs(x = "Sample collection date", y = "Site")
+
+per <- range(es$month)
+st <- per[1]
+tdy <- ceiling_date(per[2],"month")
+
+# Summarise by month of collection
+ids <- unique(es$site_id)
+months <- seq(st, tdy, by='months')
+months <- data.frame(site_id = rep(ids, each = length(months)),
+                     month = rep(months, times = length(ids)))
+es %>% 
+  group_by(site_id) |> 
+  summarise(site_first = min(collection_date),
+            total = n()) |> 
+  ungroup() -> site_first
+
+# By month of collection
+es |> 
+  group_by(site_id, month) %>% 
+  count() |> 
+  ungroup() %>% 
+  right_join(months) %>%
+  mutate(year = year(month),
+         n = replace_na(n, 0)) |> 
+  right_join(site_first) |> 
+  group_by(site_id) |> 
+  mutate(
+    # Flag as "active" after first collection
+    active = month >= floor_date(site_first,"month"),
+    # Average sampling rate since first collection (whole 4y period)
+    avg_rate_active = mean(n[active])) -> es_mth
+
+# By year of collection
+es_mth %>%   
+  group_by(site_id, site_first, total, year, avg_rate_active) %>% 
+  summarise(
+    # No. active months
+    active_mths = sum(active),
+    # Total samples 
+    yr_total = sum(n),
+    # No. months with any sample
+    sampled_mths = sum(n>0),
+    # No. months with any sample since first collection
+    sampled_mths_active = sum(n[active]>0),
+    # Average sampling rate since first collection
+    avg_rate_active = mean(n[active])) |> 
+  ungroup() |> 
+  mutate(
+    # Indicator - sample for every month during this period?
+    all_mths = sampled_mths == 12,
+    # Indicator - sample for every month since first collection?
+    all_mths_active = sampled_mths_active == active_mths,
+    # Indicator - sample for at least half of months during this period?
+    semi_reg = sampled_mths >= 6,
+    # Indicator - sample for at least half of observed months since first collection?
+    semi_reg_active = sampled_mths_active >= floor(active_mths/2)) -> es_yr
+
+es_yr |> 
+  dplyr::select(site_id:year, all_mths) |> 
+  pivot_wider(names_from = year, 
+              values_from = all_mths, 
+              names_prefix = "all_mths") -> temp
+es_yr |> 
+  dplyr::select(site_id:year,all_mths_active) |> 
+  pivot_wider(names_from = year, 
+              values_from = all_mths_active, 
+              names_prefix = "all_mths_active") -> temp2
+es_yr |> 
+  dplyr::select(site_id:year,semi_reg) |> 
+  pivot_wider(names_from = year, 
+              values_from = semi_reg, 
+              names_prefix = "semi_reg") -> temp3
+es_yr |> 
+  dplyr::select(site_id:year,semi_reg_active) |> 
+  pivot_wider(names_from = year, 
+              values_from = semi_reg_active, 
+              names_prefix = "semi_reg_active") -> temp4
+
+es_yr |> 
+  dplyr::select(site_id:year,yr_total) |> 
+  pivot_wider(names_from = year, 
+              values_from = yr_total, 
+              names_prefix = "n") |> 
+  full_join(temp) |> full_join(temp2) |> full_join(temp3) |> full_join(temp4) -> es_yr_reg
+
+# Define regularity of sampling
+es_yr_reg %>% 
+  rowwise() %>% 
+  mutate(
+    # All years at least monthly sampling
+    monthly_all = all(`all_mths2021`:`all_mths2024`),
+    # At least monthly sampling since first collection
+    monthly_active = all(`all_mths_active2021`:`all_mths_active2024`),
+    # All years semi-regular
+    semireg = all(`semi_reg2021`:`semi_reg2024`),
+    # Semi-regular since first collection
+    semireg_active = all(`semi_reg_active2021`:`semi_reg_active2024`),
+    # Monthly for any year
+    # monthly_st = any(`all_mths2021`:`all_mths2024`),
+    # Sporadic/short-term sampling - at least 12m active but less than 10 samples in total, or semi-regular for max two years
+    sporadic = (between(total, 2, 12) & site_first < as.POSIXct("2024-01-01")),
+    short_term = sum(`semi_reg_active2021`:`semi_reg_active2024`) == 1,
+    singleton = total == 1) |> 
+  mutate(site_class = factor(case_when(
+    singleton ~ "Singleton",
+    monthly_all ~ "Monthly (whole period)",
+    monthly_active ~ "Monthly (since established)",
+    # monthly_st ~ "Monthly for limited time",
+    semireg ~ "Semi-regular (whole period)",
+    semireg_active ~ "Semi-regular (since established)",
+    sporadic | short_term ~ "Sporadic or short-term",
+    TRUE ~ "Other"),
+    levels = c("Monthly (whole period)",
+               "Semi-regular (whole period)",
+               "Monthly (since established)",
+               "Semi-regular (since established)",
+               "Sporadic or short-term",
+               "Singleton",
+               "Other"))) |> 
+  select(starts_with("site")) -> es_yr_class
+
+table(es_yr_class$site_class)
+# Monthly (whole period)      Semi-regular (whole period)      Monthly (since established) Semi-regular (since established)           Sporadic or short-term                        Singleton                            Other 
+# 54                                9                               59                                3                              180                              334                                0 
+
+# Add class to main ES data and site data
+es <- full_join(es, es_yr_class)
+sites <- full_join(sites, select(es_yr_class, site_id, site_class))
+
+
 # Catchments: Radial (5km) ------------------------------------------------
 
-# Extract catchment size
+# Catchment size
 catch_5k <- sites %>% 
   select(site_id, x, y, geometry) |> 
   st_transform(proj_local) %>% 
@@ -187,16 +345,31 @@ sites$catchment_pop_5k <- catch_5k$catchment_pop_5k <- exactextractr::exact_extr
                                                         catch_5k, 
                                                         fun = "sum")  
 
-# Return to unprojected for consistency
-catch_5k <- st_transform(catch_5k, 4326)
-
-# Also add this to ES dataset
+# Also add to ES dataset
 es <- left_join(es, select(sites, site_id, catchment_pop_5k)) |> 
   # Categorise by radial catchment size
   mutate(catchment_cat_5k = factor(catchment_pop_5k > 1e5, 
                             labels = c("<100,000", ">100,000")))
 
 tabyl(es$catchment_cat_5k)
+
+# Surrounding geography
+## Precipitation
+sites$precip21 <- catch_5k$precip21 <- exactextractr::exact_extract(rain_proj, 
+                                                                    catch_5k, 
+                                                                    fun = "mean")  
+## Urbanicity - % built surface area
+tmp <- terra::extract(built_proj, catch_5k, fun = sum)[,-1]
+names(tmp) <- paste0("built",21:24)
+
+area_5k <- st_area(catch_5k)[1]
+sites <- cbind(sites, tmp) |> 
+  mutate(across(starts_with("built"), \(x) x/area_5k))
+catch_5k <- cbind(catch_5k, tmp) |> 
+  mutate(across(starts_with("built"), \(x) x/area_5k))
+
+# Return buffers to unprojected for consistency
+catch_5k <- st_transform(catch_5k, 4326)
 
 # Catchments: Watershed ---------------------------------------------------
 
@@ -207,6 +380,22 @@ catch_wsh <- rename(catch_wsh, catchment_pop_nt = population) |>
 catch_wsh$catchment_pop_wpop <- exactextractr::exact_extract(poprast_proj,
                                                           catch_wsh, 
                                                           fun = "sum")  
+# Consists of vary many watersheds (partitioning the whole area in extracted tiles, not just attributed to sites?)
+# Can't directly identify which link to sites
+# Filter these before extracting other spatial covariates
+
+# # Surrounding geography
+# ## Precipitation
+# catch_wsh$precip21 <- exactextractr::exact_extract(rain_proj, 
+#                                                    catch_wsh, 
+#                                                    fun = "mean")  
+# ## Urbanicity - % built surface area
+# tmp <- extract(built_proj, catch_wsh, fun = mean)[,-1]
+# names(tmp) <- paste0("built",21:24)
+# 
+# catch_wsh <- cbind(catch_wsh, tmp) |> 
+#   mutate(across(starts_with("built"), \(x) x/(1000^2*area)))
+
 # Return to unprojected for consistency
 catch_wsh <- st_transform(catch_wsh, 4326)
 
@@ -265,18 +454,23 @@ saveRDS(afp, here(outdir, "afp_analysis.rds"))
 saveRDS(es, here(outdir, "es_analysis.rds"))
 saveRDS(sites, here(outdir, "sites_analysis.rds"))
 
-# Shapefiles
-saveRDS(shape2, here(outdir, "shape2.rds"))
-saveRDS(W, here(outdir, "W.rds"))
-
-# Projected population raster
-writeRaster(poprast, 
-            here(outdir, "proj_pop_rast.tif"), 
-                 overwrite=T)
-
 # Catchment shapefiles and population sizes
 saveRDS(catch_5k, here(outdir,"catch_5k.rds"))
 saveRDS(catch_wsh, here(outdir,"catch_wsh.rds"))
+
+# Shapefiles
+saveRDS(shape2, here(outdir, "shape2.rds"))
+
+# Projected rasters
+writeRaster(poprast_proj, 
+            here(dir,"WorldPop", "proj_pop_rast.tif"), 
+                 overwrite=T)
+writeRaster(rain_proj, 
+            here(dir,"WorldPop", "proj_precip_rast.tif"), 
+            overwrite=T)
+writeRaster(built_proj, 
+            here(dir,"WorldPop", "proj_built_rast.tif"), 
+            overwrite=T)
 
 ################################################################################
 ################################################################################
