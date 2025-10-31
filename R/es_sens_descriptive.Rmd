@@ -8,10 +8,12 @@ output:
 
 ```{r}
 
-pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
+pacman::p_load(tidyverse, here, janitor, gtsummary, sf, spdep, patchwork)
 theme_set(theme_minimal())
 
-dir <- "data/Pakistan"
+dir <- "data/Pakistan/analysis"
+figdir <- "figures/descriptive/es"
+plotdir <- "figures/descriptive/es/plotobj"
 
 # ES data
 es <- readRDS(here(dir, "es_analysis.rds"))
@@ -42,28 +44,20 @@ n_distinct(es$site_id)
 es |> 
   group_by(year, month) |> 
   summarise(n_sites = n_distinct(site_id),
-            n_samples = n()) |> 
-  ungroup() |> 
-  ggplot(aes(month, n_sites)) +
-  geom_col() +
-  geom_line(aes(y = n_samples)) +
-  scale_y_continuous(name = "No. unique sites / collected samples") +
-  labs(x = NULL)
-
-es |> 
-  group_by(year, month) |> 
-  summarise(n_sites = n_distinct(site_id),
             samp_per_site = n()/n_sites) |> 
   ungroup() |> 
   ggplot(aes(month, n_sites)) +
   geom_col() +
   geom_line(aes(y = samp_per_site*100)) +
   scale_y_continuous(name = "No. unique sites",
-                     sec.axis = sec_axis(trans=~./100, 
+                     sec.axis = sec_axis(transform=~./100, 
                                          name = "Monthly samples per site")) +
   labs(x = NULL) -> p_collect
 
 p_collect
+saveRDS(p_collect, here(plotdir,"p_collect.rds"))
+ggsave(here(figdir,"collect_mth.png"),
+       height = 4, width = 6, bg = "white")
 
 ```
 
@@ -83,21 +77,12 @@ ggplot(sites, aes(total_collections)) +
   labs(x = "Total sample collections, 2021-24", 
        y = "No. sites")
 
-es |> 
-  group_by(site_id, year) |> 
-  count() |> 
-  ungroup() |> 
-  ggplot(aes(n, fill = as.factor(year))) + 
-  geom_density(alpha = 0.5)
-
 ```
 
 Coverage by samples per site:
 ```{r}
 
-npev_dist |> 
-  filter(period == 2021) |> 
-  # ggplot(aes(fill = npev_npafp_p)) + 
+shape2 |> 
   ggplot(fill = NULL) +
   geom_sf() + 
   geom_sf(data = sites |> arrange(total_collections), inherit.aes = F, shape = 23,
@@ -109,55 +94,288 @@ npev_dist |>
         legend.box.background = element_rect(fill = "white")) +
   labs(fill = "Total no. samples",
        title = "Environmental surveillance coverage in Pakistan",
-       subtitle = "All sampled sites")
+       subtitle = "All sampled sites") -> p_covg_all
 
-npev_dist |> 
-  filter(period == 2021) |> 
+p_covg_all
+saveRDS(p_covg_all, here(plotdir,"p_covg_all.rds"))
+ggsave(here(figdir, "site_covg_all.png"),
+       height = 6, width = 6, bg = "white")
+
+shape2 |> 
   ggplot(fill = NULL) +
   geom_sf() + 
-  geom_sf(data = sites |> filter(site_id %in% included_sites), inherit.aes = F, aes(shape = "Site"), fill = "white") +
+  geom_sf(data = sites |> filter(total_collections >= min_ss), 
+          inherit.aes = F, aes(shape = "Site"), fill = "white") +
   scale_shape_manual(values = 23) + 
   theme(axis.text = element_blank(), 
         legend.position = c(0.8,0.2),
         legend.box.background = element_rect(fill = "white")) +
   labs(shape = NULL, 
        title = "Environmental surveillance coverage in Pakistan",
-       subtitle = paste0("Sites with at least ",min_ss," sample(s), 2021-2024"))
+       subtitle = paste0("Sites with at least ",min_ss," sample(s), 2021-2024")) -> p_covg_incl
+
+p_covg_incl
+saveRDS(p_covg_incl, here(plotdir,"p_covg_incl.rds"))
+ggsave(here(figdir,"site_covg_incl.png"),
+       height = 6, width = 6, bg = "white")
+
+```
+
+### Regularity of sampling
+
+```{r}
+
+es |> 
+  mutate(site_id = forcats::fct_reorder(site_id, 
+                                         desc(as.numeric(site_class)))) |> 
+  ggplot(aes(collection_date, site_id, col = site_class)) +
+  geom_point(pch = 18) + 
+  theme(axis.text.y = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.background = element_rect(fill = "white")) +
+  scale_colour_viridis_d(option = "turbo") +
+  labs(x = "Sample collection date", y = "Site", colour = "Site Class") -> p_site_samp
+
+p_site_samp
+saveRDS(p_site_samp, here(plotdir,"p_site_samp.rds"))
+ggsave(here(figdir,"site_sampling.png"),
+       height = 10, width = 8, bg = "white")
+
+es |> 
+  mutate(site_id = forcats::fct_reorder(site_id, desc(as.numeric(site_class)))) |> 
+  ggplot(aes(collection_date, site_id, col = site_class)) +
+  geom_point(pch = 18) + 
+  facet_wrap(~admin_1, scales = "free_y") +
+  theme(axis.text.y = element_blank(), 
+        panel.grid.major = element_blank(),
+        panel.background = element_rect(fill = "white")) +
+  scale_colour_viridis_d(option = "turbo") +
+  labs(x = "Sample collection date", y = "Site", colour = "Site Class") -> p_site_samp_prov
+
+p_site_samp_prov
+saveRDS(p_site_samp, here(plotdir,"p_site_samp.rds"))
+ggsave(here(figdir,"site_sampling_prov.png"),
+       height = 8, width = 10, bg = "white")
+```
+Proportion of classes by province:
+```{r}
+
+sites |> 
+  st_join(shape2, st_within) |> 
+  ggplot(aes(adm1_name, fill = site_class)) + 
+  geom_bar() + 
+  scale_fill_viridis_d(option = "turbo") + 
+  theme(legend.position = c(0.2,0.8), legend.box.background = element_rect(fill = "white")) +
+  labs(x = NULL, y = "No. sites", fill = "Site class") -> p_class_prov
+
+p_class_prov
+saveRDS(p_class_prov, here(plotdir,"p_class_prov.rds"))
+ggsave(here(figdir,"site_class_prov.png"),
+       height = 6, width = 8, bg = "white")
+
+sites |> 
+  st_join(shape2, st_within) |> 
+  st_drop_geometry() |> 
+  group_by(adm1_name, site_class) |> 
+  count() |> 
+  group_by(adm1_name) |> 
+  mutate(p = n/sum(n)) |> 
+  ggplot(aes(adm1_name, p, fill = site_class)) + 
+  geom_col() + 
+  scale_fill_viridis_d(option = "turbo") + 
+  labs(x = NULL, y = "Proportion", fill = "Site class") -> p_class_prov_p
+
+p_class_prov_p
+saveRDS(p_class_prov_p, here(plotdir,"p_class_prov_p.rds"))
+ggsave(here(figdir,"site_class_prov_p.png"),
+       height = 6, width =10, bg = "white")
 
 ```
 ### PV positivity
 
 - PV+ samples will be excluded from analysis due to masking of NPEV.
+- Should this include vaccine virus or just wild type?
 
 Distribution of PV+ samples over time:
 ```{r}
 
+# Only wild/VD polioviruses
 tabyl(es$pv)
-
 es |> 
   group_by(month) |> 
   summarise(npv = sum(!pv),
-            pv = sum(pv)) |> 
-  pivot_longer(npv:pv) |> 
-  mutate(name = factor(name, labels = c("Non-polio","Polio"))) |> 
+            pv = sum(pv)) |>
+  pivot_longer(npv:pv) |>
+  mutate(name = factor(name, labels = c("PV-","PV+"))) |> 
   ggplot(aes(month, value, fill = name)) +
   geom_col(position = position_dodge()) +
-  scale_fill_manual(values = c("grey", "black")) +
+  scale_fill_manual(values = c("black", "grey")) +
   scale_y_continuous(trans = "sqrt") +
   theme(legend.position = c(0.2,0.9)) +
-  labs(x = "Month", y = "No. samples", fill = NULL) -> p_pvpos
-p_pvpos
+  labs(x = "Month", y = "No. samples", fill = NULL) -> p_pv_pos
+p_pv_pos
+
+saveRDS(p_pv_pos, here(plotdir,"p_pv_pos.rds"))
+ggsave(here(figdir,"p_pv_pos.png"),
+       height = 4, width = 6, bg = "white")
+
+# Also vaccine viruses
+tabyl(grepl("VACCINE",es$virus_type_s))
+es |> 
+  group_by(month) |> 
+  summarise(npv = sum(!grepl("VACCINE",virus_type_s) & !pv),
+            pv = sum(grepl("VACCINE",virus_type_s) | pv)) |> 
+  pivot_longer(npv:pv) |>
+  mutate(name = factor(name, labels = c("PV-","PV+ (incl. vaccine)"))) |> 
+  ggplot(aes(month, value, fill = name)) +
+  geom_col(position = position_dodge()) +
+  scale_fill_manual(values = c("black", "grey")) +
+  scale_y_continuous(trans = "sqrt") +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = "Month", y = "No. samples", fill = NULL) -> p_pv_vax_pos
+p_pv_vax_pos
+
+saveRDS(p_pv_vax_pos, here(plotdir,"p_pv_vax_pos.rds"))
+ggsave(here(figdir,"p_pv_vax_pos.png"),
+       height = 4, width = 6, bg = "white")
 
 ```
+Just looking at WPV/VDPV:
 -> increasing since mid-2023. 
 -> Reduced sample size in recent years - will this be a problem?
 
 ```{r}
 
-p_collect + p_pvpos +
+p_collect + p_pv_vax_pos +
   plot_annotation(tag_levels = "A")
-ggsave(here("figures/descriptive/es/es_time.png"),
+ggsave(here(figdir,"es_time.png"),
        height = 4, width = 10, bg = "white")
+
+```
+
+### Positivity by site class
+
+```{r}
+
+es |> 
+  mutate(npev = factor(is.na(npev), levels = c(T,F), labels = c("No","Yes")),
+         site_class = fct_relabel(site_class, 
+                                  ~gsub("or ","or\n",
+                                    gsub(" (","\n(", .x, fixed = T)))) |> 
+  ggplot(aes(site_class, fill = site_class, alpha = npev)) + 
+  geom_bar(position = position_dodge()) + 
+  labs(x = NULL, y= "Samples", fill = NULL, alpha = "NPEV detected") + 
+  guides(fill = "none") +
+  scale_alpha_manual(values = c(0.5,1)) + 
+  scale_fill_viridis_d(option = "turbo") +
+  theme(legend.position = c(0.8,0.8)) -> p_npev_class
+
+p_npev_class
+saveRDS(p_npev_class, here(plotdir,"p_npev_class.rds"))
+ggsave(here(figdir,"npev_byclass.png"),
+       height = 4, width = 10, bg = "white")
+
+es |> 
+  mutate(
+    pv = factor((grepl("VACCINE",virus_type_s) | pv),
+                     levels = c(F,T), labels = c("No",
+                                                 "Yes")),
+    # pv = factor(pv, levels = c(T,F), labels = c("PV-","PV+")),
+         site_class = fct_relabel(site_class, 
+                                  ~gsub("or ","or\n",
+                                    gsub(" (","\n(", .x, fixed = T)))) |> 
+  ggplot(aes(site_class, fill = site_class, alpha = pv)) + 
+  geom_bar(position = position_dodge()) + 
+  labs(x = NULL, y= "Samples", fill = NULL, alpha = "Any poliovirus detected\n(incl. vaccine)") + 
+  guides(fill = "none") +
+  scale_alpha_manual(values = c(0.5,1)) + 
+  scale_fill_viridis_d(option = "turbo") +
+  theme(legend.position = c(0.8,0.8)) -> p_pv_class
+
+p_pv_class
+saveRDS(p_pv_class, here(plotdir,"p_pv_class.rds"))
+ggsave(here(figdir,"pv_vax_byclass.png"),
+       height = 4, width = 10, bg = "white")
+
+```
+* Across all site classes except full monthly, more likely to detect NPEV than not. 
+* Samples from sites with frequent and consistent collections are more like 50:50 (the target level).
+
+The pattern across NPEV is interesting since surveillance is not specifically *looking* for NPEV. 
+* There has been an increase overall in NPEV in recent years, so newer sites (monthly since est.) have a higher proportion of NPEV+ samples. 
+
+For PV on the other hand, samples from regularly sampled sites are much more likely to be positive. This makes sense because sites positioned/collections scheduled to find poliovirus. 
+
+Quickly test this:
+
+```{r}
+
+es |> 
+  mutate(site_class = fct_drop(site_class),
+         npev = factor(is.na(npev), 
+                       levels = c(T,F), labels = c("Negative", "Positive")),
+         pv = factor((grepl("VACCINE",virus_type_s) | pv),
+                     levels = c(F,T), labels = c("Negative", "Positive"))) |> 
+  tbl_summary(include = c(npev, pv),
+              by = site_class,
+              label = list(npev = "NPEV", 
+                           pv = "Poliovirus (incl. vaccine)")) |> 
+  add_p()
+
+```
+
+Look at cross-detection of PV/NPEV:
+
+```{r}
+es |> 
+  mutate(npev = factor(is.na(npev), 
+                       levels = c(T,F), labels = c("Negative", "Positive"))) |> 
+  tbl_summary(include = npev,
+              by = pv,
+              label = list(npev = "NPEV", 
+                           pv = "Poliovirus (excl. vaccine)")) |> 
+  add_p()
+
+es |> 
+  mutate(npev = factor(is.na(npev), 
+                       levels = c(T,F), labels = c("Negative", "Positive")),
+         pv_vax = factor((grepl("VACCINE",virus_type_s) | pv),
+                     levels = c(F,T), labels = c("Negative", "Positive"))) |> 
+  tbl_summary(include = npev,
+              by = pv_vax,
+              label = list(npev = "NPEV", 
+                           pv = "Poliovirus (incl. vaccine)")) |> 
+  add_p()
+
+es |> 
+  mutate(npev = factor(is.na(npev), 
+                       levels = c(T,F), labels = c("Negative", "Positive")),
+         final_class = fct_na_value_to_level(final_class, "None")) |> 
+  tbl_summary(include = npev,
+              by = final_class,
+              label = list(npev = "NPEV"))
+
+```
+
+Definitely seems less likely to detect NPEV if any PV detected. 
+
+# Other site characteristics
+
+```{r}
+
+es |> 
+  left_join(sites) |> 
+  mutate(npev = factor(is.na(npev), 
+                       levels = c(T,F), labels = c("Negative", "Positive")),
+         pv = factor((grepl("VACCINE",virus_type_s) | pv),
+                     levels = c(F,T), labels = c("Negative", "Positive")),
+         built21 = as.numeric(built21*100)) |> 
+  tbl_summary(include = c(catchment_pop_5k, built21, precip21),
+              by = pv,
+              label = list(catchment_pop_5k = "Population catchment", 
+                           built21 = "Built-up surface (%)",
+                           precip21 = "Annual average precipitation")) |> 
+  add_p()
 
 ```
 
