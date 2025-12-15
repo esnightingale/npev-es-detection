@@ -49,7 +49,7 @@ shape2 <- readRDS(here(dir,"shape2.rds"))
 poprast <- rast(here(dir,"WorldPop","pak_ppp_2020_UNadj_constrained.tif")) 
 
 ### Novel-T watersheds
-catch_wsh <- readRDS(here(dir,"analysis", "watershed.rds"))
+catch_wsh <- readRDS(here(dir,"analysis/detection", "watershed.rds"))
 
 ### Annual mean precipitation https://hub.worldpop.org/doi/10.5258/SOTON/WP00772 
 rain <- rast(here(dir,"WorldPop","pak_ppt_2021_yravg_tc_100m_v1.tif"))
@@ -86,6 +86,17 @@ shape2$guid_pop_dens <- shape2$guid_total_pop/shape2$shape_area_km2
 hist(shape2$guid_pop_dens)  
 summary(shape2$guid_pop_dens)
 
+# Set up simpler guid to avoid later parsing issues
+shape2$guid_old <- shape2$guid
+shape2$guid <- factor(shape2$guid_old, 
+                      levels = unique(shape2$guid_old),
+                      labels = 1:nrow(shape2))
+
+# Define spatial adjacency matrix (for BYM model)
+nb <- spdep::poly2nb(shape2)  
+W <- spdep::nb2mat(nb, style = "B", zero.policy = TRUE) |> as.matrix() 
+rownames(W) <- shape2$guid
+
 # ggplot(shape2) +
 #   geom_sf(aes(fill = as.numeric(guid_pop_dens))) +
 #   scale_fill_viridis_c(name = paste0("Pop Density (", 
@@ -98,7 +109,11 @@ summary(shape2$guid_pop_dens)
 
 afp <- afp_ |> 
   # Distinguish polio and non-polio cases
-  mutate(npafp = !(grepl("WILD", virus_type_s) | grepl("VDPV",virus_type_s))) |> 
+  # - To examine NPEV among NP-AFP, not PV-AFP cases due to masking
+  # Also flag *any* EV detection (incl. wild/VDPV/vaccine/npev)
+  # - To align with official ES indicator of EV detection
+  mutate(npafp = !(grepl("WILD", virus_type_s) | grepl("VDPV",virus_type_s)),
+         ev = !is.na(virus_type_s)) |> 
   # exclude AFP among over-15s 
   filter(age_m < 15*12) 
 
@@ -113,7 +128,9 @@ afp_agg <- afp |>
   group_by(guid, month) |> 
   summarise(n_afp = n(),
             n_npafp = sum(npafp, na.rm = T),
-            n_npev = sum(npev == "Yes", na.rm = T)) |> 
+            n_ev = sum(ev, na.rm = T),
+            n_npev = sum(npev == "Yes", na.rm = T),
+            n_wpv = sum(grepl("WILD", virus_type_s))) |> 
   ungroup() |> 
   # Join with U15 population denominator, expanding to all districts/months
   right_join(npafp_ind) |>
@@ -121,6 +138,7 @@ afp_agg <- afp |>
   mutate(npafp_r = n_npafp*1e5/denominator,
          npev_npafp_p = n_npev/n_npafp,
          npev_afp_p = n_npev/n_afp,
+         ev_afp_p = n_ev/n_afp,
          t = as.numeric(as.factor(period)),
          month_of_year = month(month, label = TRUE, abbr = TRUE)) |> 
   # Add population density
@@ -131,7 +149,7 @@ afp_agg <- afp |>
 # Note: Some denominators are imputed (all for 2021)
 
 # Check agreement of npafp numerator and tallied npafp case records:
-afp |> 
+afp_agg |> 
   mutate(check = n_npafp == numerator,
          diff = n_npafp - numerator) -> tmp
 
@@ -143,9 +161,9 @@ hist(tmp$diff)
 #    - Only excluded 6 due to missing guid so that's not it
   
 # Now fill in zero-counts for district/months with no afp notifications
-afp <- mutate(afp, across(c(n_afp:npev_afp_p), ~replace_na(., 0))) 
+afp_agg <- mutate(afp_agg, across(c(n_afp:npev_afp_p), ~replace_na(., 0))) 
 
-summary(afp)
+summary(afp_agg)
 
 # ES data -----------------------------------------------------------------
 
@@ -158,36 +176,39 @@ es = es_ %>%
   mutate(month = floor_date(collection_date, "month"),
          month_of_year = month(collection_date, label = T),
          year = year(month),
-         # Flag any samples in which poliovirus was detected to later remove
+         # Flag samples with virulent poliovirus detected (excl. vaccine)
          pv = grepl("WILD",virus_type_s) | grepl("PV", virus_type_s),
+         # Flag samples with any EV detected
+         ev = !is.na(virus_type_s),
          # Define factor for NPEV positivity
          npev_f = case_when(is.na(npev) ~ "NPEV-",
                             !is.na(npev) ~ "NPEV+"), 
-         site_type = case_when((grepl("PUMPING",site_name)|
-                                  (grepl("PUMP", site_name) & grepl("STATION", site_name))|
-                                  grepl("PLANT", site_name)) ~ "WWTP or Pumping station",
-                               TRUE ~ "Other") |> 
-           factor(levels = c("WWTP or Pumping station","Other")),
-         across(c(iso_3_code:site_id,sample_condition, npev, final_class), as.factor)) |> 
-  # Filter to sites with at least min_ss samples
-  group_by(site_id) |> 
-  mutate(site_total = n()) |> 
-  ungroup() 
+         across(c(iso_3_code:site_id,sample_condition, npev, final_class), as.factor)) 
 
 summary(es)
-tabyl(es$site_type)
 
 # ES sites 
 
 sites <- es |> 
-  group_by(guid, site_id, x, y) |> 
-  summarise(first_collection = min(collection_date),
-            first_collection_y = year(first_collection),
-            total_collections = n(),
+  mutate(type = case_when((grepl("PUMPING",site_name)|
+                             (grepl("PUMP", site_name) & grepl("STATION", site_name))|
+                             grepl("PLANT", site_name)) ~ "WWTP or Pumping station",
+                          TRUE ~ "Other") |> 
+      factor(levels = c("WWTP or Pumping station","Other"))) |> 
+  group_by(guid, site_id, site_name, x, y, coord_imp, type) |> 
+  summarise(first = min(collection_date),
+            first_y = year(first),
+            total = n(),
             p_wpv = mean(final_class == "WPV1"),
-            p_npev = mean(!is.na(npev))) |> 
+            p_npev = mean(!is.na(npev)),
+            p_ev = mean(ev)) |> 
   ungroup() |> 
   st_as_sf(coords = c("x","y"), crs = 4326, remove = F) 
+
+tabyl(sites$type)
+# sites$type   n   percent
+# WWTP or Pumping station  80 0.1251956
+# Other 559 0.8748044
 
 # Define consistency class ------------------------------------------------
 
@@ -213,31 +234,26 @@ ids <- unique(es$site_id)
 months <- seq(st, tdy, by='months')
 months <- data.frame(site_id = rep(ids, each = length(months)),
                      month = rep(months, times = length(ids)))
-es %>% 
-  group_by(site_id) |> 
-  summarise(site_first = min(collection_date),
-            total = n()) |> 
-  ungroup() -> site_first
 
 # By month of collection
 es |> 
   group_by(site_id, month) %>% 
   count() |> 
   ungroup() %>% 
-  right_join(months) %>%
+  right_join(months) %>% 
   mutate(year = year(month),
          n = replace_na(n, 0)) |> 
-  right_join(site_first) |> 
+  right_join(select(sites, site_id, first, total)) |> 
   group_by(site_id) |> 
   mutate(
     # Flag as "active" after first collection
-    active = month >= floor_date(site_first,"month"),
+    active = month >= floor_date(first,"month"),
     # Average sampling rate since first collection (whole 4y period)
     avg_rate_active = mean(n[active])) -> es_mth
 
 # By year of collection
 es_mth %>%   
-  group_by(site_id, site_first, total, year, avg_rate_active) %>% 
+  group_by(site_id, first, total, year, avg_rate_active) %>% 
   summarise(
     # No. active months
     active_mths = sum(active),
@@ -303,7 +319,7 @@ es_yr_reg %>%
     # Monthly for any year
     # monthly_st = any(`all_mths2021`:`all_mths2024`),
     # Sporadic/short-term sampling - at least 12m active but less than 10 samples in total, or semi-regular for max two years
-    sporadic = (between(total, 2, 12) & site_first < as.POSIXct("2024-01-01")),
+    sporadic = (between(total, 2, 12) & first < as.POSIXct("2024-01-01")),
     short_term = sum(`semi_reg_active2021`:`semi_reg_active2024`) == 1,
     singleton = total == 1) |> 
   mutate(site_class = factor(case_when(
@@ -330,8 +346,7 @@ table(es_yr_class$site_class)
 
 # Add class to main ES data and site data
 es <- full_join(es, es_yr_class)
-sites <- full_join(sites, select(es_yr_class, site_id, site_class))
-
+sites <- left_join(sites, es_yr_class)
 
 # Catchments: Radial (5km) ------------------------------------------------
 
@@ -341,30 +356,29 @@ catch_5k <- sites %>%
   st_transform(proj_local) %>% 
   st_buffer(dist = units::set_units(5, "km"))
 
-sites$catchment_pop_5k <- catch_5k$catchment_pop_5k <- exactextractr::exact_extract(poprast_proj,
+catch_5k$catchment_pop <- exactextractr::exact_extract(poprast_proj,
                                                         catch_5k, 
                                                         fun = "sum")  
 
-# Also add to ES dataset
-es <- left_join(es, select(sites, site_id, catchment_pop_5k)) |> 
-  # Categorise by radial catchment size
-  mutate(catchment_cat_5k = factor(catchment_pop_5k > 1e5, 
-                            labels = c("<100,000", ">100,000")))
+# Also categorise by radial catchment size
+catch_5k$catchment_cat <- factor(catch_5k$catchment_pop > 1e5, 
+                                    labels = c("<100,000", ">100,000"))
 
-tabyl(es$catchment_cat_5k)
+tabyl(catch_5k$catchment_cat)
+# catch_5k$catchment_cat   n   percent
+# <100,000 525 0.8215962
+# >100,000 114 0.1784038
 
 # Surrounding geography
 ## Precipitation
-sites$precip21 <- catch_5k$precip21 <- exactextractr::exact_extract(rain_proj, 
-                                                                    catch_5k, 
-                                                                    fun = "mean")  
+catch_5k$precip21 <- exactextractr::exact_extract(rain_proj, 
+                                                  catch_5k, 
+                                                  fun = "mean")  
 ## Urbanicity - % built surface area
 tmp <- terra::extract(built_proj, catch_5k, fun = sum)[,-1]
 names(tmp) <- paste0("built",21:24)
 
 area_5k <- st_area(catch_5k)[1]
-sites <- cbind(sites, tmp) |> 
-  mutate(across(starts_with("built"), \(x) x/area_5k))
 catch_5k <- cbind(catch_5k, tmp) |> 
   mutate(across(starts_with("built"), \(x) x/area_5k))
 
@@ -407,13 +421,14 @@ plot(log(catch_wsh$catchment_pop_nt), log(catch_wsh$catchment_pop_wpop))
 abline(0,1)
 # Novel-T populations somewhat smaller than populations extracted from wpop raster to the same polygons, and less varied.
 
-# Connect sites to associated watersheds (where available)
+# Connect sites/5k buffer to associated watersheds (where available)
 sites_wsh <- st_join(sites, catch_wsh, 
                        st_is_within_distance, dist = set_units(100,"m")) |> 
   group_by(site_id) |> 
-  slice_head(n = 1)
+  slice_head(n = 1) |> 
+  left_join(select(st_drop_geometry(catch_5k), site_id, catchment_pop))
 
-plot(log(sites_wsh$catchment_pop_5k), log(sites_wsh$catchment_pop_nt))
+plot(log(sites_wsh$catchment_pop), log(sites_wsh$catchment_pop_nt))
 abline(0,1)
 # Novel-T catchments overall smaller in pop size than 5km radius
 
@@ -448,18 +463,20 @@ ggplot() +
 outdir <- paste0(dir,"/analysis")
 
 # AFP cases
-saveRDS(afp, here(outdir, "afp_analysis.rds"))
+saveRDS(afp, here(outdir, "prevalence/afp_linelist.rds"))
+saveRDS(afp_agg, here(outdir, "prevalence/afp_analysis.rds"))
 
 # ES 
-saveRDS(es, here(outdir, "es_analysis.rds"))
-saveRDS(sites, here(outdir, "sites_analysis.rds"))
+saveRDS(es, here(outdir, "detection/es_analysis.rds"))
+saveRDS(sites, here(outdir, "detection/sites_analysis.rds"))
 
 # Catchment shapefiles and population sizes
-saveRDS(catch_5k, here(outdir,"catch_5k.rds"))
-saveRDS(catch_wsh, here(outdir,"catch_wsh.rds"))
+saveRDS(catch_5k, here(outdir,"detection/catch_5k.rds"))
+saveRDS(catch_wsh, here(outdir,"detection/catch_wsh.rds"))
 
 # Shapefiles
 saveRDS(shape2, here(outdir, "shape2.rds"))
+saveRDS(W, here(outdir, "W.rds"))
 
 # Projected rasters
 writeRaster(poprast_proj, 

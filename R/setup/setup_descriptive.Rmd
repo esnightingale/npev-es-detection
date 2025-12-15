@@ -1,0 +1,217 @@
+---
+title: "Analysis data setup: Descriptive"
+output: html_notebook
+---
+
+```{r}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
+theme_set(theme_minimal())
+
+dir <- "data/Pakistan/analysis"
+figdir <- "figures/descriptive"
+
+# AFP data
+afp <- readRDS(here(dir, "prevalence/afp_linelist.rds"))
+
+# ES data
+es <- readRDS(here(dir, "detection/es_analysis.rds"))
+sites <- readRDS(here(dir, "detection/sites_analysis.rds"))
+
+# Shapefiles and adjacency matrix
+shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+
+# Define a minimum site sample size for analysis 
+min_ss = 10
+
+incl_sites <- filter(sites, total >= min_ss)
+es |> mutate(incl_site = site_id %in% incl_sites$site_id) -> es
+
+```
+
+
+```{r}
+
+afp |>  
+  mutate(wpv = !is.na(wild_1)) |> 
+  ggplot(aes(month,fill = wpv)) +
+  geom_bar() +
+  scale_y_continuous(trans = "sqrt")
+
+afp |>  
+  filter(!is.na(wild_1)) |> 
+  mutate(grp = "AFP") |> 
+  select(month, grp) -> afp_wpv
+
+es |> 
+  filter(grepl("WILD",virus_type_s)) |> 
+  mutate(grp = "ES") |> 
+  select(month, grp) |> 
+  bind_rows(afp_wpv) |> 
+  ggplot(aes(month, fill = grp)) +
+  geom_bar(position = position_dodge2(preserve = "single")) +
+  scale_fill_manual(values = c("chocolate1", "deepskyblue")) +
+  theme(legend.position = c(0.2,0.8)) +
+  labs(x = NULL, y = NULL, title = "No. WPV+ samples by surveillance stream", fill = NULL)
+ggsave(here(figdir, "wpv_pos_by_system.png"), height = 3, width = 5, bg = "white")
+
+afp |> 
+  group_by(month) |> 
+  summarise(n = n(),
+            `WPV+` = sum(!is.na(wild_1)),
+            `WPV-` = n - `WPV+`,
+            p_wpv = `WPV+`*100/n) |>
+  ungroup() |> 
+  pivot_longer(`WPV+`:`WPV-`) |>
+  ggplot() + 
+  geom_col(aes(x = month, y = value,  fill = name)) +
+  geom_line(aes(x = month, y = p_wpv*21, group = 1),
+            col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
+  scale_fill_manual(values = c("grey","grey50")) +
+  scale_y_continuous(name = "Notified AFP cases",
+                     sec.axis = sec_axis(trans=~./21,
+                                         name = "% positive")) +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = NULL, y = "Count", fill = NULL, 
+       subtitle = "WPV detection in AFP samples") -> p_wpv_afp
+
+es |> 
+  group_by(month) |> 
+  summarise(n = n(),
+            `WPV+` = sum(grepl("WILD", virus_type_s)),
+            `WPV-` = n - `WPV+`,
+            p_wpv = `WPV+`*100/n) |>
+  ungroup() |> 
+  pivot_longer(`WPV+`:`WPV-`) |>
+  ggplot() + 
+  geom_col(aes(x = month, y = value,  fill = name)) +
+  geom_line(aes(x = month, y = p_wpv*3, group = 1),
+            col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
+  scale_fill_manual(values = c("grey","grey50")) +
+  scale_y_continuous(name = "Collected ES samples",
+                     sec.axis = sec_axis(trans=~./3,
+                                         name = "% positive")) +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = NULL, y = "Count", fill = NULL,
+       subtitle = "WPV detection in ES samples") -> p_wpv_es
+
+p_wpv_afp / p_wpv_es
+ggsave(here(figdir, "wpv_afp_es.png"), height = 7, width = 7, bg = "white")
+```
+
+
+```{r}
+
+afp |>  
+  filter(ev) |> 
+  mutate(grp = "AFP") |> 
+  select(month, grp) -> afp_ev
+
+es |> 
+  filter(ev) |> 
+  mutate(grp = "ES") |> 
+  select(month, grp) |> 
+  bind_rows(afp_ev) |> 
+  ggplot(aes(month, fill = grp)) +
+  geom_bar(position = position_dodge2(preserve = "single")) +
+  scale_fill_manual(values = c("chocolate1", "deepskyblue")) +
+  theme(legend.position = c(0.2,0.8)) +
+  labs(x = NULL, y = NULL, title = "No. EV+ samples by surveillance stream", fill = NULL)
+ggsave(here(figdir, "ev_pos_by_system.png"), height = 3, width = 5, bg = "white")
+
+afp |> 
+  group_by(month) |> 
+  summarise(n = n(),
+            `EV+` = sum(ev),
+            `EV-` = n - `EV+`,
+            p_ev = `EV+`*100/n) |>
+  ungroup() |> 
+  pivot_longer(`EV+`:`EV-`) |>
+  ggplot() + 
+  geom_col(aes(x = month, y = value,  fill = name)) +
+  geom_line(aes(x = month, y = p_ev*21, group = 1),
+            col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
+  scale_fill_manual(values = c("grey","grey50")) +
+  scale_y_continuous(name = "Notified AFP cases",
+                     sec.axis = sec_axis(trans=~./21,
+                                         name = "% positive")) +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = NULL, y = "Count", fill = NULL, 
+       subtitle = "EV detection in AFP samples") -> p_ev_afp
+
+es |> 
+  group_by(month) |> 
+  summarise(n = n(),
+            `EV+` = sum(ev),
+            `EV-` = n - `EV+`,
+            p_ev = `EV+`*100/n) |>
+  ungroup() |> 
+  pivot_longer(`EV+`:`EV-`) |>
+  ggplot() + 
+  geom_col(aes(x = month, y = value,  fill = name)) +
+  geom_line(aes(x = month, y = p_ev*3, group = 1),
+            col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
+  scale_fill_manual(values = c("grey","grey50")) +
+  scale_y_continuous(name = "Collected ES samples",
+                     sec.axis = sec_axis(trans=~./3,
+                                         name = "% positive")) +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = NULL, y = "Count", fill = NULL,
+       subtitle = "EV detection in ES samples") -> p_ev_es
+
+p_ev_afp / p_ev_es
+ggsave(here(figdir, "ev_afp_es.png"), height = 7, width = 7, bg = "white")
+```
+
+```{r}
+
+es |> 
+  group_by(month_of_year) |> 
+  summarise(n = n(),
+            `EV+` = sum(ev),
+            `EV-` = n - `EV+`,
+            p_ev = `EV+`*100/n) |>
+  ungroup() |> 
+  pivot_longer(`EV+`:`EV-`) |>
+  ggplot() + 
+  geom_col(aes(x = month_of_year, y = value,  fill = name)) +
+  geom_line(aes(x = month_of_year, y = p_ev*1, group = 1),
+            col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
+  scale_fill_manual(values = c("grey","grey50")) +
+  scale_y_continuous(name = "Collected ES samples",
+                     sec.axis = sec_axis(trans=~./1,
+                                         name = NULL)) +
+  theme(legend.position = c(0.2,0.9)) +
+  labs(x = "Collection month", y = "Count", fill = NULL) -> p_moy
+
+p_moy
+
+```
+
+What does EV positivity look like by site?
+
+```{r}
+
+es |> 
+  group_by(site_id, year) |> 
+  summarise(n = n(),
+            ev = sum(ev), 
+            ev_neg = sum(!ev),
+            ev_p = ev/n) |> 
+  ungroup() -> ev_site_yr
+
+ggplot(ev_site_yr, aes(ev_p)) + 
+  geom_histogram() + 
+  facet_wrap(~year)
+
+ev_site_yr |> 
+  tbl_summary(include = c(n, ev, ev_p, ev_neg),
+              by = year,
+              label = list(n = "Samples collected", 
+                           ev = "EV positive", 
+                           ev_neg = "EV negative",
+                           ev_p = "Proportion EV positive")) |> 
+  add_overall() |> 
+  as_gt()
+
+```

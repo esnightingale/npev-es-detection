@@ -1,0 +1,356 @@
+---
+title: 'Part 1: District NPEV prevalence'
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+
+pacman::p_load(tidyverse, here, gtsummary, sf, brms, tidybayes, bayesplot,  
+               units, loo, posterior, patchwork)
+theme_set(theme_minimal())
+
+dir <- "data/Pakistan/analysis/"
+outdir <- "output/prevalence/" #final
+figdir <- "figures/prevalence/fit"
+
+source(here("R/utils/check_model_fit.R"))
+source(here("R/utils/plot_re_fcns.R"))
+
+# Fitting data
+fitdata <- read_rds(here(dir,"prevalence/fitdata.rds"))
+
+# Prediction data (including district:months with zero NPAFP)
+preddata <- read_rds(here(dir,"prevalence/preddata.rds"))
+
+# Shapefiles
+shape2 <- read_rds(here(dir,"shape2.rds"))
+W <- read_rds(here(dir, "W.rds"))
+
+# Selected model
+# fit_prior <- read_rds(here(outdir,"fit_prior.rds"))
+# fit <- read_rds(here(outdir,"fit_posterior.rds"))
+fit_prior <- read_rds(here(outdir,"prior_bym_st_guid.rds"))
+fit <- read_rds(here(outdir,"fit_bym_st_guid.rds"))
+
+# Define adm1-guid key for later matching:
+prov_guid <- fitdata |> 
+  select(adm1_name, guid) |> 
+  distinct() |> 
+  mutate(did = row_number())
+
+# Set colour palette for provinces
+pal_prov <- viridis::turbo(n_distinct(shape2$adm1_name))  
+names(pal_prov) <- sort(unique(shape2$adm1_name))
+
+```
+
+
+
+## Fit checks
+### Prior
+
+```{r}
+
+pp_check(fit_prior, 
+         "bars",
+         samples = 200) -> p_prior_dist
+
+mcmc_areas(fit_prior, 
+           pars = get_variables(fit_prior)[1:9],
+           prob = 0.8) -> parms_prior
+
+parms_prior +
+  ggtitle("Prior distributions",
+                      "with medians and 80% intervals")
+ggsave(here(figdir,"prior_sample.png"), 
+       height = 5, width = 6, bg = "white")
+```
+
+### Posterior
+
+```{r}
+
+mcmc_trace(fit, 
+           pars = get_variables(fit)[1:9],
+           facet_args = list(nrow = 2))
+ggsave(here(figdir,"mcmc_trace.png"),
+       height = 4, width = 8, bg = "white")
+
+pp_check(fit, type = "rootogram") +
+  scale_x_sqrt() +
+  theme(legend.position = "inside",
+        legend.position.inside = c(0.8, 0.8)) 
+
+pp_check(fit, type = "pit_ecdf")
+
+```
+
+### Prior/posterior comparison
+```{r}
+
+pp_check(fit, 
+         "bars",
+         samples = 200) -> p_post_dist
+p_prior_dist + p_post_dist +
+  plot_annotation(tag_levels = "A")
+
+ggsave(here(figdir,"prior_post_dist.png"),
+       height = 3, width = 8, bg = "white")
+
+mcmc_areas(fit, 
+           pars = get_variables(fit)[1:9],
+           prob = 0.8) -> parms_post
+
+parms_post +
+  ggtitle("Posterior distributions",
+                      "with medians and 80% intervals")
+ggsave(here(figdir,"post_sample.png"), 
+       height = 5, width = 6, bg = "white")
+
+prior_draws = as_draws_df(fit_prior)[,1:9]
+post_draws = as_draws_df(fit)[,1:9]
+
+# Stack the prior and posterior draws for each parameter
+#  and reshape to long format
+prior_post_draws = bind_rows(
+    prior_draws %>% 
+      mutate(type="Prior") %>% 
+      rename_all(~gsub("prior_", "", .)),
+    post_draws %>% 
+      select(-matches("Prior")) %>% 
+      mutate(type="Posterior")
+  ) %>% 
+  pivot_longer(-type)
+
+prior_post_draws %>%
+ ggplot(aes(value, name, colour=type)) +
+  stat_slab(data = . %>% filter(type != "true value"),
+               aes(slab_colour=type), fill=NA, normalize="groups", 
+               scale=0.7, slab_size=0.5, fatten_point=1.5) +
+  geom_segment(data=. %>% filter(type=="true value"), 
+               aes(x=value, xend=value, y=name, yend=..y.. + 0.7),
+               colour="grey10", size=0.3) +
+  coord_cartesian(xlim=c(-3,3)) +
+  labs(x=NULL, y=NULL, colour=NULL, fill=NULL, slab_colour=NULL) +
+  theme(panel.grid.major.y=element_line(colour="grey10", size=0.2)) -> p_prior_post
+
+# prior_post_draws %>% 
+#   ggplot(aes(value, colour=type)) +
+#     geom_density(aes(y=after_stat(scaled))) + 
+#     facet_wrap(vars(name), scales="free") +
+#     labs(x=NULL, y=NULL, colour=NULL, fill=NULL, slab_colour=NULL) +
+#     theme(axis.text.y=element_blank(),
+#           axis.ticks.y=element_blank()) -> p_prior_post
+
+p_prior_post
+```
+
+### Fit diagnostics and residuals
+
+```{r}
+
+summ_fit <- summary(fit)
+
+bind_rows(
+  summ_fit$fixed[, 5:7],
+  bind_rows(summ_fit$random)[, 5:7],
+  summ_fit$splines[, 5:7])
+
+simres <- dh_check_brms(fit, integer = TRUE, type = type)
+testDispersion(simres) 
+testOutliers(simres) 
+
+```
+
+## Fitted spatial effects
+
+### BYM component
+
+```{r}
+
+fit %>%
+  gather_draws(rcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(preddata, guid, adm1_name) |> 
+              distinct() |> 
+              mutate(guid = as.numeric(guid))) |> 
+  mutate(component = "Total") -> summ_car
+
+summ_car |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", col = "Province",
+       subtitle = "Total CAR component") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+fit %>%
+  gather_draws(nszcar[guid]) %>%
+  median_qi() |> 
+  left_join(select(preddata, guid, adm1_name) |> 
+              distinct() |> 
+              mutate(guid = as.numeric(guid))) |> 
+  mutate(component = "Non-spatial") -> summ_car_ns
+
+summ_car |> 
+  bind_rows(summ_car_ns) |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, .value,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name,
+             alpha = component)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province", alpha = "Component",
+       subtitle = "Conditional auto-regressive (CAR) effect") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank()) -> p_car
+
+p_car
+ggsave(here(figdir,"car.png"), 
+       height = 5, width = 8, bg = "white")
+
+```
+
+### Total district deviation
+
+- Province intercept + BYM 
+
+```{r}
+
+fit %>%
+  spread_draws(r_adm1_name[adm1_name, Intercept],rcar[guid]) %>% 
+  left_join(mutate(prov_guid, guid = as.numeric(guid)), by = "guid") |> 
+  filter(adm1_name.x == adm1_name.y) |> 
+  median_qi(r_guid = r_adm1_name + rcar) -> tmp
+
+tmp |> 
+  left_join(mutate(prov_guid, guid = as.numeric(guid))) |> 
+  arrange(adm1_name, guid) |> 
+  mutate(did = row_number()) |> 
+  ggplot(aes(did, r_guid,
+             ymin = .lower, ymax = .upper,
+             col = adm1_name)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  labs(x = "District", y = "Posterior estimate", 
+       col = "Province",
+       subtitle = "Total district deviation from average") +
+  scale_colour_viridis_d(option = "turbo") +
+  theme(axis.text.x = element_blank())
+
+ggsave(here(figdir,"district_effects.png"), 
+       height = 5, width = 8, bg = "white")
+
+```
+## Fitted temporal effects
+
+```{r}
+
+fit |> 
+  conditional_smooths() |>
+  plot(plot = F) -> tmp
+
+```
+
+### Long-term
+#### Overall
+```{r}
+
+p_lt_ <- ggplot_build(tmp[[1]])
+
+p_lt_$plot$data |> 
+  mutate(effect1__ = (effect1__*47)+1) |> 
+  ggplot(mapping = p_lt_$plot$mapping) + 
+  geom_ribbon(alpha = 0.4, fill = "grey60") +
+  geom_line(col = "#3366FF") +
+  scale_x_continuous(breaks = seq(1,48,by=12), labels=2021:2024) +
+  labs(y = "Long-term trend", x = NULL) -> p_lt
+
+p_lt
+ggsave(here(figdir,"time_longterm.png"), 
+       height = 5, width = 7, bg = "white")
+
+```
+
+#### By district
+```{r}
+
+p_lt_d_ <- ggplot_build(tmp[[2]])
+
+p_lt_d_$plot$data |> 
+  mutate(effect1__ = (effect1__*47)+1) |>  
+  rename(District = guid) |> 
+  ggplot(mapping = p_lt_d_$plot$mapping) + 
+  geom_ribbon(aes(group = District), alpha = 0.01, fill = "grey60", col = NA) +
+  geom_line(aes(group = District), alpha = 0.2, col = "#3366FF") +
+  guides(col = "none",fill = "none") +
+  scale_x_continuous(breaks = seq(1,48,by=12), labels=2021:2024) +
+  labs(x = NULL, y = "District-specific deviation") -> p_lt_comb
+
+p_lt_comb
+ggsave(here(figdir,"time_longterm_district.png"), 
+       height = 5, width = 7, bg = "white")
+
+```
+
+### Season
+```{r}
+
+p_season <- ggplot_build(tmp[[3]])
+
+p_season$plot$data |> 
+  mutate(effect1__ = (effect1__*11)+1) |>  
+  ggplot(mapping = p_season$plot$mapping) + 
+  geom_ribbon(alpha = 0.4, fill = "grey60") +
+  geom_line(col = "#3366FF") +
+  labs(y = "Overall seasonal trend", x = NULL) +
+  scale_x_discrete(limits = month.abb) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) -> p_season
+
+p_season
+ggsave(here(figdir,"time_season.png"), 
+       height = 5, width = 7, bg = "white")
+
+```
+
+```{r}
+
+fit %>%
+  gather_draws(r_t[t,]) %>%
+  median_qi() |> 
+  mutate(t = (t*47)+1) -> summ_r_t
+
+summ_r_t |>  
+  ggplot(aes(t, .value,
+             ymin = .lower, ymax = .upper)) + 
+  geom_hline(yintercept = 0, col = "grey") +
+  geom_errorbar() + 
+  geom_point() +
+  scale_x_continuous(breaks = seq(1,48,by=12), labels=2021:2024) +
+  labs(x = "Month", y = "Posterior estimate", subtitle = "Temporal random effect") -> p_iid
+
+p_iid
+ggsave(here(figdir,"time_iid.png"), 
+       height = 5, width = 7, bg = "white")
+```
+
+```{r}
+
+p_season + (p_lt / p_lt_comb) + plot_annotation(tag_levels = "A")
+
+ggsave(here(figdir,"temp_re.png"), 
+       height = 5, width = 10, bg = "white")
+```

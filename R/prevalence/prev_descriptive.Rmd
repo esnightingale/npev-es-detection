@@ -12,9 +12,10 @@ pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
 theme_set(theme_minimal())
 
 dir <- "data/Pakistan"
+figdir <- "figures/descriptive/afp"
 
 # NP-AFP analysis data
-data <- readRDS(here(dir, "afp_analysis.rds"))
+data <- readRDS(here(dir, "analyis/prevalence/afp_analysis.rds"))
 
 # Shapefiles and adjacency matrix
 shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
@@ -26,11 +27,13 @@ shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
 ```{r}
 
 data |> 
-  tbl_summary(include = c(n_afp, n_npafp, npafp_r, n_npev, npev_npafp_p),
+  tbl_summary(include = c(n_afp, n_npafp, npafp_r, n_ev, ev_afp_p, n_npev, npev_npafp_p),
               by = year,
               label = list(n_afp = "AFP notifications", 
                            n_npafp = "Non-polio AFP notifications", 
-                           npafp_r = "Non-polio AFP rate (per 100,000 U15s)", 
+                           npafp_r = "Non-polio AFP rate (per 100,000 U15s)", , 
+                           n_ev = "EV positives", 
+                           ev_afp_p = "Crude EV prevalence",
                            n_npev = "NPEV positives", 
                            npev_npafp_p = "Crude NPEV prevalence")) |> 
   add_overall() |> 
@@ -139,12 +142,13 @@ data |>
   pivot_longer(`NPEV+`:`NPEV-`) |>
   ggplot() + 
   geom_col(aes(x = month_of_year, y = value,  fill = name)) +
-  geom_line(aes(x = month_of_year, y = p_npev*150, group = 1)) +
+  geom_line(aes(x = month_of_year, y = p_npev*150, group = 1),
+            col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
+  scale_fill_manual(values = c("grey","grey50")) +
   scale_y_continuous(name = "Notified NP-AFP cases",
                      sec.axis = sec_axis(trans=~./150,
-                                         name = "% positive")) +
-  theme(legend.position = c(0.1,0.9)) +
-  scale_fill_manual(values = c("grey","indianred")) +
+                                         name = NULL)) +
+  theme(legend.position = c(0.2,0.9)) +
   labs(x = "Paralysis onset month", y = "Count", fill = NULL) -> p_moy
 
 # Seasonal trend, by year
@@ -155,15 +159,15 @@ data |>
             r_npev = n_npev*100/n_npafp) |>
   ungroup() |>
   ggplot(aes(x = month_of_year, y = r_npev, 
-             group = factor(year), col = factor(year), fill = factor(year))) + 
+             group = factor(year), col = factor(year))) + 
   geom_point() + 
   geom_smooth(se = F) + 
   scale_colour_viridis_d(option = "mako", end = 0.8) +
   scale_fill_viridis_d(option = "mako", end = 0.8) +
-  theme(legend.position = c(0.1,0.9)) +
+  theme(legend.position = c(0.9,0.85)) +
   # guides(fill = "none") +
   ylim(0,100) +
-  labs(x = "Paralysis onset month", y = "% Positive", col = "Year", fill = "Year") -> p_moy_yr
+  labs(x = "Paralysis onset month", y = "% Positive", col = NULL) -> p_moy_yr
 
 # Seasonal trend, by province
 data |> 
@@ -206,9 +210,11 @@ Overall decrease year on year, with more pronounced seasonality in 2021.
 ```{r}
 
 p_moy + p_moy_yr + 
-  plot_annotation(tag_levels = "A")
+  plot_annotation(tag_levels = "A") -> p_seas_npev
 
-ggsave(here("figures/descriptive/afp/npev_time.png"),
+p_seas_npev
+saveRDS(p_seas_npev, here(figdir,"plotobj/npev_seas.png"))
+ggsave(here(figdir,"npev_seas.png"),
        height = 4, width = 10, bg = "white")
 
 ```
@@ -220,7 +226,7 @@ ggsave(here("figures/descriptive/afp/npev_time.png"),
 (p_afp_rates + p_pvpos)/
   (p_dist_yr + p_moy_dist) +
   plot_annotation(tag_levels = "A")
-ggsave("./figures/descriptive/afp/Figure_1.png", 
+ggsave(figdir,"Figure_1.png", 
        bg = "white",
        height = 6, width = 8, units = "in")
 

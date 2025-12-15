@@ -1,7 +1,23 @@
 
+check_residuals <- function(fit, type = "bootstrap", var = NULL){
+
+  if(is.null(var)){
+    simres <- dh_check_brms(fit, integer = TRUE, type = type)
+    testDispersion(simres) |> print()
+    testOutliers(simres) |> print()
+    return()
+  }
+
+  if(!is.null(var)){
+    simres <- dh_check_brms(fit, integer = TRUE, type = type, plot = F)
+    plot(simres, form = var) |> print()
+    return()
+  }
+  
+}
 
 
-check_residuals <- function(fit, data, shapefile){
+plot_residuals <- function(fit, data, shapefile){
   
   res <- residuals(fit) |> as.data.frame()
   data <- data |> 

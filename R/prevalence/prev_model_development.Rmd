@@ -8,31 +8,25 @@ output:
 
 ```{r}
 
-library(devtools)
-if(!require(cmdstanr)){
-  devtools::install_github("stan-dev/cmdstanr", dependencies=c("Depends", "Imports"))
-}
-if(!require(INLA)){
-install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
-}
+# remotes::install_github("Pakillo/DHARMa.helpers")
 
-pacman::p_load(tidyverse, here, gtsummary, sf, spdep, rstan, brms, tidybayes, bayesplot, units, loo, posterior, cmdstanr, INLA, geostan, patchwork)
+pacman::p_load(tidyverse, here, gtsummary, sf, spdep, rstan, brms, tidybayes, bayesplot, units, loo, posterior, DHARMa, DHARMa.helpers)
 theme_set(theme_minimal())
 
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
-dir <- "data/Pakistan/analysis"
-outdir <- "output/prevalence"
+dir <- "data/Pakistan/analysis/prevalence"
+outdir <- "output/prevalence/exploratory"
 
-source("utils/check_model_fit.R")
-source("utils/plot_re_fcns.R")
+source("../utils/check_model_fit.R")
+source("../utils/plot_re_fcns.R")
 
 # NP-AFP analysis data
 data <- readRDS(here(dir, "afp_analysis.rds"))
 
 # Shapefiles 
-shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+shape2 <- readRDS(here(dir,"../shape2.rds")) |> st_transform(4326)
 
 ```
 
@@ -76,17 +70,6 @@ Setting up data for fitting and prediction:
 
 ```{r}
 
-# Set up simpler guid to avoid later parsing issues
-shape2$guid_old <- shape2$guid
-shape2$guid <- factor(shape2$guid_old, 
-                      levels = unique(shape2$guid_old),
-                      labels = 1:nrow(shape2))
-
-# Define spatial adjacency matrix (for BYM model)
-nb <- spdep::poly2nb(shape2)  
-W <- spdep::nb2mat(nb, style = "B", zero.policy = TRUE) |> as.matrix() 
-rownames(W) <- shape2$guid
-
 # Set up data
 preddata <- mutate(data, 
                   # Scale time variables
@@ -104,7 +87,6 @@ preddata <- mutate(data,
 fitdata <- filter(preddata, n_npafp > 0)
 write_rds(preddata, here(dir, "preddata.rds"))
 write_rds(fitdata, here(dir, "fitdata.rds"))
-write_rds(shape2, here(dir, "shape2.rds"))
 
 # Define adm1-guid key for later matching:
 prov_guid <- preddata |> 
@@ -219,9 +201,11 @@ plot_pp_checks(fit_base)
 plot(fit_base)
 
 # Residuals
-check_residuals(fit_base, 
-                data = fitdata, 
-                shapefile = shape2)
+# check_residuals(fit_base, 
+#                 data = fitdata, 
+#                 shapefile = shape2)
+
+check_residuals(fit_base)
 
 ```
 
@@ -310,9 +294,11 @@ mcmc_areas(fit_bym,
 plot_pp_checks(fit_bym)
 plot(fit_bym)
 
-check_residuals(fit_bym, 
-                data = fitdata, 
-                shapefile = shape2)
+# check_residuals(fit_bym, 
+#                 data = fitdata, 
+#                 shapefile = shape2)
+check_residuals(fit_bym)
+
 ```
 
 Explore temporal AC a bit further:
@@ -473,6 +459,7 @@ fit_bym_ar <- update(fit_bym,
 ```{r}
 summary(fit_bym_ar)
 bayes_R2(fit_bym_ar)
+check_residuals(fit_bym_ar)
 ```
 
 Plot temporal components:
@@ -542,9 +529,14 @@ mcmc_areas(fit_bym_st,
 plot_pp_checks(fit_bym_st)
 plot(fit_bym_st)
 
-check_residuals(fit_bym_st, 
-                data = fitdata, 
-                shapefile = shape2)
+# check_residuals(fit_bym_st, 
+#                 data = fitdata, 
+#                 shapefile = shape2)
+
+check_residuals(fit_bym_st)
+check_residuals(fit_bym_st, var = fitdata$t)
+check_residuals(fit_bym_st, var = fitdata$adm1_name)
+
 ```
 
 Temporal components:
@@ -675,9 +667,14 @@ mcmc_areas(fit_bym_st_guid,
 
 plot_pp_checks(fit_bym_st_guid)
 
-check_residuals(fit_bym_st_guid, 
-                data = fitdata, 
-                shapefile = shape2)
+# check_residuals(fit_bym_st_guid, 
+#                 data = fitdata, 
+#                 shapefile = shape2)
+
+check_residuals(fit_bym_st_guid)
+check_residuals(fit_bym_st_guid, var = fitdata$t)
+check_residuals(fit_bym_st_guid, var = fitdata$adm1_name)
+
 ```
 
 Setup temporal plots:
