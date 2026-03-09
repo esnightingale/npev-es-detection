@@ -11,7 +11,8 @@ output:
 pacman::p_load(tidyverse, here, cmdstanr, brms, gtsummary, units, loo)
 theme_set(theme_minimal())
 
-dir <- "data/Pakistan"
+source(here("R/config.R"))
+dir <- file.path(dir, "analysis/prevalence")
 
 ```
 

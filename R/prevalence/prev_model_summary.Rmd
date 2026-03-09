@@ -1,5 +1,5 @@
 ---
-title: 'Part 1: District NPEV prevalence'
+title: 'Part 1: District EV prevalence'
 output:
   html_document:
     df_print: paged
@@ -11,8 +11,9 @@ pacman::p_load(tidyverse, here, gtsummary, sf, brms, tidybayes, bayesplot,
                units, loo, posterior, patchwork)
 theme_set(theme_minimal())
 
-dir <- "data/Pakistan/analysis/"
-outdir <- "output/prevalence/" #final
+source(here("R/config.R"))
+dir <- file.path(dir, "analysis")
+outdir <- file.path("output/prevalence", country)
 figdir <- "figures/prevalence/fit"
 
 source(here("R/utils/check_model_fit.R"))

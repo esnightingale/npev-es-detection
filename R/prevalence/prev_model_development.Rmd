@@ -1,5 +1,5 @@
 ---
-title: 'Part 1: District NPEV prevalence'
+title: 'Part 1: District EV prevalence'
 subtitle: '1B: Modelling'
 output:
   html_document:
@@ -16,11 +16,12 @@ theme_set(theme_minimal())
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
-dir <- "data/Pakistan/analysis/prevalence"
-outdir <- "output/prevalence/exploratory"
+source(here("R/config.R"))
+dir <- file.path(dir, "analysis/prevalence")
+outdir <- file.path("output/prevalence", country)
 
-source("../utils/check_model_fit.R")
-source("../utils/plot_re_fcns.R")
+source(here("R/utils/check_model_fit.R"))
+source(here("R/utils/plot_re_fcns.R"))
 
 # NP-AFP analysis data
 data <- readRDS(here(dir, "afp_analysis.rds"))
@@ -42,14 +43,14 @@ plot_pp_checks <- function(fit){
 
 ## Model specification
 
-1. NPEV prevalence model
+1. EV prevalence model
 
-Use a beta-binomial model as some sample counts are small. 
+Use a beta-binomial model as some sample counts are small? 
 
-Number of NPEV+ AFP cases in district $i$ at time $t$:
+Number of EV+ AFP cases in district $i$ at time $t$:
 
 $$ Y_{i,t} \sim  Beta-Binomial(M_{i,t}, p_{i,t}) $$
-where $M_{i,t}$ is the number of notified non-polio AFP cases and $p_{i,t}$ is the estimated prevalence of NPEV in this sampled population.
+where $M_{i,t}$ is the number of notified AFP cases and $p_{i,t}$ is the estimated prevalence of EV in this sampled population.
 
 The prevalence per district-month is assumed dependent on a seasonal trend, spatial correlation between neighbouring districts, and other spatio-temporal noise:
 
@@ -59,7 +60,8 @@ This model will be constructed incrementally to justify the addition of complexi
 The predicted prevalence and SE for each district-month will be extracted for input as a predictor of NPEV detection probability in subsequent ES model. 
 
 Other notes:
-Based on Kroiss et al. analysis, NPEV prevalence was around 25% per month. 
+Based on Kroiss et al. analysis, NPEV prevalence among NP-AFP cases was around 25% per month. 
+Assume EV prevalence among AFP cases similar?
  => N(-1,1) informative prior on the global intercept. 
 
 ## Data setup 

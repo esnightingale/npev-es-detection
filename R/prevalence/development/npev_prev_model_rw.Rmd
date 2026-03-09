@@ -15,17 +15,18 @@ theme_set(theme_minimal())
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
-dir <- "data/Pakistan"
+source(here("R/config.R"))
+dir <- file.path(dir, "analysis/prevalence")
 
 # source("./utils/fit_npafp_model.R")
-source("./utils/check_model_fit.R")
+source(here("R/utils/check_model_fit.R"))
 
 # Analysis dataset
 fitdata <- readRDS(here(dir, "fitdata.rds"))
 
 # Shapefiles and adjacency matrix
-shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
-W <- readRDS(here(dir,"W.rds"))
+shape2 <- readRDS(here(dir,"../shape2.rds")) |> st_transform(4326)
+W <- readRDS(here(dir,"../W.rds"))
 
 # Baseline brms fit
 fit_base <- readRDS("output/fit_base.rds")

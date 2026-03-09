@@ -1,6 +1,6 @@
 ################################################################################
 ################################################################################
-# Fit NPEV model
+# Fit EV prevalence model
 ################################################################################
 
 pacman::p_load(here, rstan, brms)
@@ -10,8 +10,9 @@ gc()
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 
-dir <- "data/Pakistan/analysis/prevalence"
-outdir <- "output/prevalence/final"
+source(here("R/config.R"))
+dir <- file.path(dir, "analysis/prevalence")
+outdir <- file.path("output/prevalence", country)
 
 # Read data ---------------------------------------------------------------
 # - Set up in npev_prev_model_exploration.Rmd
@@ -22,7 +23,7 @@ W <- readRDS(here(dir, "../W.rds"))
 # Model specification -----------------------------------------------------
 
 f = bf(
-  n_npev | trials(n_npafp) ~     
+  n_ev | trials(n_afp) ~     
     # Overall average prevalence
     1 + 
     (1|adm1_name) + (1|t) +
@@ -30,9 +31,9 @@ f = bf(
     car(W, gr = guid, type = "bym2") + 
     # Long-term spline over time
     s(t, k = 10) +
-    # Seasonal temporal splines overall and by province
+    # Seasonal temporal spline
     s(month_of_year, bs = "cc", k = 12) +
-    # Long-term deviation by guid (penalise wiggliness now we're fitting many)
+    # Long-term deviation by province (penalise wiggliness now we're fitting many)
     s(t, guid, bs = "fs", k = 6)
 )
 

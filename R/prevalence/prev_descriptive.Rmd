@@ -1,5 +1,5 @@
 ---
-title: 'Part 1: District NPEV prevalence'
+title: 'Part 1: District EV prevalence'
 subtitle: '1A: Descriptive'
 output:
   html_document:
@@ -11,11 +11,11 @@ output:
 pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
 theme_set(theme_minimal())
 
-dir <- "data/Pakistan"
+source(here("R/config.R"))
 figdir <- "figures/descriptive/afp"
 
 # NP-AFP analysis data
-data <- readRDS(here(dir, "analyis/prevalence/afp_analysis.rds"))
+data <- readRDS(here(dir, "analysis/prevalence/afp_analysis.rds"))
 
 # Shapefiles and adjacency matrix
 shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
@@ -41,7 +41,7 @@ data |>
 
 ```
 
-Plot crude NPEV prevalence among notified non-polio AFP cases, per district and over time:
+Plot crude EV prevalence among notified AFP cases, per district and over time:
 
 ```{r}
 
@@ -80,46 +80,46 @@ data |>
   theme(legend.position = c(0.2,0.9)) +
   labs(x = "Month", y = "No. AFP notifications", fill = NULL) -> p_pvpos
 
-# Annual NPEV+ rate by district
+# Annual EV+ rate by district
 data |> 
   group_by(guid, year) |> 
-  summarise(n_npafp = sum(n_npafp),
-            n_npev = sum(n_npev),
-            r_npev = n_npev/n_npafp) |>
+  summarise(n_afp = sum(n_afp),
+            n_ev = sum(n_ev),
+            r_ev = n_ev/n_afp) |>
   ungroup() |>
   right_join(shape2) |> 
-  ggplot(aes(fill = r_npev, geometry = SHAPE)) + 
+  ggplot(aes(fill = r_ev, geometry = SHAPE)) + 
   geom_sf(col = NA) +
   facet_wrap(~year) +
-  scale_fill_viridis_c(name = "NPEV+\nPrevalence", trans = "sqrt") + 
+  scale_fill_viridis_c(name = "EV+\nPrevalence", trans = "sqrt") + 
   theme_void() -> p_dist_yr
 
 
 # Longer term trend, by province
 data |> 
   group_by(month, adm1_name) |> 
-  summarise(n_npafp = sum(n_npafp),
-            n_npev = sum(n_npev),
-            r_npev = n_npev/n_npafp) |>
+  summarise(n_afp = sum(n_afp),
+            n_ev = sum(n_ev),
+            r_ev = n_ev/n_afp) |>
   ungroup() |>
-  ggplot(aes(x = month, y = r_npev, 
+  ggplot(aes(x = month, y = r_ev, 
              group = adm1_name, col = adm1_name, fill = adm1_name)) + 
   # geom_jitter(alpha = 0.2) + 
   geom_smooth(alpha = 0.3) + 
-  labs(x = NULL, y = "NPEV+ Prevalence") -> p_mth_prov
+  labs(x = NULL, y = "EV+ Prevalence") -> p_mth_prov
 
 # Correlation with population density
 data |> 
   group_by(guid_pop_dens, guid) |> 
-  summarise(n_npafp = sum(n_npafp),
-            n_npev = sum(n_npev),
-            r_npev = n_npev/n_npafp) |>
+  summarise(n_afp = sum(n_afp),
+            n_ev = sum(n_ev),
+            r_ev = n_ev/n_afp) |>
   ungroup() |>
-  ggplot(aes(x = as.numeric(guid_pop_dens), y = r_npev)) + 
+  ggplot(aes(x = as.numeric(guid_pop_dens), y = r_ev)) + 
   geom_jitter(alpha = 0.2) +
   geom_smooth(alpha = 0.1, lwd = 0.2, se = T) + 
   scale_x_continuous(trans = "log10") +
-  labs(x = "Log population density (/km2)", y = "NPEV+ Prevalence") -> p_dens_dist
+  labs(x = "Log population density (/km2)", y = "EV+ Prevalence") -> p_dens_dist
 
 p_afp_rates
 p_pvpos
@@ -134,18 +134,18 @@ Seasonal trends
 # Seasonal trend, overall
 data |> 
   group_by(month_of_year) |> 
-  summarise(n_npafp = sum(n_npafp),
-            `NPEV+` = sum(n_npev),
-            `NPEV-` = n_npafp - `NPEV+`,
-            p_npev = `NPEV+`*100/n_npafp) |>
+  summarise(n_afp = sum(n_afp),
+            `EV+` = sum(n_ev),
+            `EV-` = n_afp - `EV+`,
+            p_ev = `EV+`*100/n_afp) |>
   ungroup() |> 
-  pivot_longer(`NPEV+`:`NPEV-`) |>
+  pivot_longer(`EV+`:`EV-`) |>
   ggplot() + 
   geom_col(aes(x = month_of_year, y = value,  fill = name)) +
-  geom_line(aes(x = month_of_year, y = p_npev*150, group = 1),
+  geom_line(aes(x = month_of_year, y = p_ev*150, group = 1),
             col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
   scale_fill_manual(values = c("grey","grey50")) +
-  scale_y_continuous(name = "Notified NP-AFP cases",
+  scale_y_continuous(name = "Notified AFP cases",
                      sec.axis = sec_axis(trans=~./150,
                                          name = NULL)) +
   theme(legend.position = c(0.2,0.9)) +
@@ -154,11 +154,11 @@ data |>
 # Seasonal trend, by year
 data |> 
   group_by(month_of_year, year) |> 
-  summarise(n_npafp = sum(n_npafp),
-            n_npev = sum(n_npev),
-            r_npev = n_npev*100/n_npafp) |>
+  summarise(n_afp = sum(n_afp),
+            n_ev = sum(n_ev),
+            r_ev = n_ev*100/n_afp) |>
   ungroup() |>
-  ggplot(aes(x = month_of_year, y = r_npev, 
+  ggplot(aes(x = month_of_year, y = r_ev, 
              group = factor(year), col = factor(year))) + 
   geom_point() + 
   geom_smooth(se = F) + 
@@ -172,30 +172,30 @@ data |>
 # Seasonal trend, by province
 data |> 
   group_by(month_of_year, adm1_name) |> 
-  summarise(n_npafp = sum(n_npafp),
-            n_npev = sum(n_npev),
-            r_npev = n_npev/n_npafp) |>
+  summarise(n_afp = sum(n_afp),
+            n_ev = sum(n_ev),
+            r_ev = n_ev/n_afp) |>
   ungroup() |>
-  ggplot(aes(x = month_of_year, y = r_npev, 
+  ggplot(aes(x = month_of_year, y = r_ev, 
              group = adm1_name, col = adm1_name, fill = adm1_name)) + 
   # geom_jitter(alpha = 0.2) + 
   geom_smooth(alpha = 0.5) + 
-  labs(x = NULL, y = "NPEV+ Prevalence") -> p_moy_prov
+  labs(x = NULL, y = "EV+ Prevalence") -> p_moy_prov
 
 # Seasonal trend, by district
 data |> 
   group_by(month_of_year, guid) |> 
-  summarise(n_npafp = sum(n_npafp),
-            n_npev = sum(n_npev),
-            r_npev = n_npev/n_npafp) |>
+  summarise(n_afp = sum(n_afp),
+            n_ev = sum(n_ev),
+            r_ev = n_ev/n_afp) |>
   ungroup() |>
-  ggplot(aes(x = month_of_year, y = r_npev, 
+  ggplot(aes(x = month_of_year, y = r_ev, 
              group = guid)) + 
   # geom_jitter(alpha = 0.2) + 
   geom_smooth(alpha = 0.1, lwd = 0.2, se = F, 
               col = "steelblue") + 
   theme(axis.text.x = element_text(angle = 45)) +
-  labs(x = NULL, y = "NPEV+ Prevalence") -> p_moy_dist
+  labs(x = NULL, y = "EV+ Prevalence") -> p_moy_dist
 
 
 p_moy
@@ -213,8 +213,8 @@ p_moy + p_moy_yr +
   plot_annotation(tag_levels = "A") -> p_seas_npev
 
 p_seas_npev
-saveRDS(p_seas_npev, here(figdir,"plotobj/npev_seas.png"))
-ggsave(here(figdir,"npev_seas.png"),
+saveRDS(p_seas_npev, here(figdir,"plotobj/ev_seas.png"))
+ggsave(here(figdir,"ev_seas.png"),
        height = 4, width = 10, bg = "white")
 
 ```
@@ -226,7 +226,7 @@ ggsave(here(figdir,"npev_seas.png"),
 (p_afp_rates + p_pvpos)/
   (p_dist_yr + p_moy_dist) +
   plot_annotation(tag_levels = "A")
-ggsave(figdir,"Figure_1.png", 
+ggsave(here(figdir,"Figure_1.png"), 
        bg = "white",
        height = 6, width = 8, units = "in")
 

@@ -3,11 +3,11 @@
 # Extract predicted prevalence from fitted model
 # 
 # Draw and summarise model-estimated prevalence for each district/month, 
-# including months with zero NPAFP.
+# including months with zero AFP.
 # 
-# Note: 
+# Note (prior to NPEV -> EV switch): 
 # Currently exclude two entire districts absent from fitting data (no recorded 
-# NPAFP in this period). These can't be predicted for due to the district-specific
+# AFP in this period). These can't be predicted for due to the district-specific
 # spline component, which BRMS doesn't let you exclude from prediction...
 # Ideally want to predict for these districts based on neighbouring prevalence 
 # (through BYM component), province prevalence, and overall time trends. 
@@ -16,8 +16,12 @@
 pacman::p_load(tidyverse, here, brms)
 rm(list = ls(all = TRUE)) 
 
-dir <- "data/Pakistan/analysis/prevalence"
-outdir <- "output/prevalence/final"
+source(here::here("R/config.R"))
+dir <- file.path(dir, "analysis/prevalence")
+outdir <- file.path("output/prevalence", country)
+
+# Load fitted model
+fit <- readRDS(here(outdir, "fit_posterior.rds"))
 
 # Fitting data
 fitdata <- read_rds(here(dir,"fitdata.rds"))
@@ -95,7 +99,7 @@ pred_draws <- pred |>
 
 # Save predictions --------------------------------------------------------
 
-saveRDS(pred, here(outdir,"pred_prev_npev.rds"))
-saveRDS(pred_draws, here(outdir,"draws_prev_npev.rds"))
+saveRDS(pred, here(outdir,"pred_prev_ev.rds"))
+saveRDS(pred_draws, here(outdir,"draws_prev_ev.rds"))
 
 ################################################################################

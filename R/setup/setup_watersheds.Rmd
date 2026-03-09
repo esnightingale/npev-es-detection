@@ -12,7 +12,8 @@ Import and combine modelled watersheds from Novel-T platform for ES sites in Pak
 
 pacman::p_load(tidyverse, sf, here, utils, janitor, mapview)
 
-dir <- here("data","Pakistan")
+source(here("R/config.R"))
+dir <- here("data", country)
 
 # District shapefiles
 shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
@@ -139,6 +140,7 @@ Intersect district shapefiles with watersheds:
 
 ```{r}
 
-saveRDS(watershed, here(dir,"analysis","watershed.rds"))
+dir.create(here(dir, "analysis", "detection"), recursive = TRUE, showWarnings = FALSE)
+saveRDS(watershed, here(dir, "analysis", "detection", "watershed.rds"))
 
 ```

@@ -11,18 +11,12 @@ rm(list = ls(all = TRUE))  # clear all data
 
 ################################################################################
 
-# Set parameters
-## Input file paths
-dir <- "data/Pakistan"
+# Set parameters (from config)
+source(here("R/config.R"))
+
 filename_afp = here(dir,"linelist_afp_clean.csv")
 filename_es = here(dir,"linelist_es_clean.csv")
 filename_npafp = here(dir,"npafp_clean.csv")
-
-## Time period of interest
-tp <- ymd(c("2021-01-01","2024-12-01"))
-
-## Local projection
-proj_local <- "EPSG:32642"
 
 # ----- #
 
@@ -45,20 +39,34 @@ npafp_ind <- read_csv(filename_npafp) |>
 ### District shapefiles
 shape2 <- readRDS(here(dir,"shape2.rds")) 
 
-### Population raster
-poprast <- rast(here(dir,"WorldPop","pak_ppp_2020_UNadj_constrained.tif")) 
+### Population raster (WorldPop: pop_2021_CN_100m_R2025A or legacy ppp_2020_UNadj)
+pop_file <- list.files(here(dir, "WorldPop"), 
+                      pattern = paste0(raster_prefix, "_(pop_2021|ppp_.*UNadj).*\\.tif$"), 
+                      full.names = TRUE)
+if (length(pop_file) == 0) stop("Population raster not found in ", here(dir, "WorldPop"))
+# Prefer new format (pop_2021) over legacy (ppp_)
+pop_file <- pop_file[order(!grepl("pop_2021", pop_file))]
+poprast <- terra::rast(pop_file[1])
 
-### Novel-T watersheds
-catch_wsh <- readRDS(here(dir,"analysis/detection", "watershed.rds"))
+### Novel-T watersheds (run R/setup/setup_watersheds.Rmd first; for Nigeria create data/Nigeria/Novel-T/ and run with country="Nigeria")
+watershed_path <- here(dir, "analysis/detection", "watershed.rds")
+if (!file.exists(watershed_path)) {
+  stop("Watershed file not found at ", watershed_path, 
+       ". Run R/setup/setup_watersheds.Rmd first, or create analysis/detection/ and add watershed.rds.")
+}
+catch_wsh <- readRDS(watershed_path)
 
 ### Annual mean precipitation https://hub.worldpop.org/doi/10.5258/SOTON/WP00772 
-rain <- rast(here(dir,"WorldPop","pak_ppt_2021_yravg_tc_100m_v1.tif"))
+rain_file <- list.files(here(dir, "WorldPop"), pattern = paste0(raster_prefix, "_ppt_.*\\.tif$"), full.names = TRUE)
+if (length(rain_file) == 0) stop("Precipitation raster not found in ", here(dir, "WorldPop"))
+rain <- terra::rast(rain_file[1])
 
 ### Built up surface https://hub.worldpop.org/doi/10.5258/SOTON/WP00772 
 f <- list.files(here(dir, "WorldPop"), 
                 full.names = T,
-                pattern = "pak_built_S_GHS_U_wFGW_100m_v1_")
-built <- rast(f)
+                pattern = paste0(raster_prefix, "_built_.*\\.tif$"))
+if (length(f) == 0) stop("Built-up raster(s) not found in ", here(dir, "WorldPop"))
+built <- terra::rast(f)
 
 ################################################################################
 # Set up data for analysis ------------------------------------------------
@@ -67,9 +75,9 @@ built <- rast(f)
 
 ## Projected data
 shape2_proj <- st_transform(shape2, proj_local) 
-poprast_proj <- project(poprast, proj_local)
-rain_proj <- project(rain, proj_local)
-built_proj <- project(built, proj_local) 
+poprast_proj <- terra::project(poprast, proj_local)
+rain_proj <- terra::project(rain, proj_local)
+built_proj <- terra::project(built, proj_local) 
 
 # Define district area in km2
 shape2$shape_area_km2  <- st_area(shape2_proj) |> units::set_units("km^2")
@@ -117,7 +125,7 @@ afp <- afp_ |>
   # exclude AFP among over-15s 
   filter(age_m < 15*12) 
 
-# # Check NPAFP data has all districts/months:
+# # Check AFP data has all districts/months:
 # tmp <- expand.grid(
 #     district = levels(npafp_ind$guid),
 #     month_index = 1:12
@@ -133,18 +141,18 @@ afp_agg <- afp |>
             n_wpv = sum(grepl("WILD", virus_type_s))) |> 
   ungroup() |> 
   # Join with U15 population denominator, expanding to all districts/months
-  right_join(npafp_ind) |>
+  right_join(npafp_ind) |> 
   # Define rate/prevalence variables of interest and time indicators
   mutate(npafp_r = n_npafp*1e5/denominator,
          npev_npafp_p = n_npev/n_npafp,
          npev_afp_p = n_npev/n_afp,
          ev_afp_p = n_ev/n_afp,
          t = as.numeric(as.factor(period)),
-         month_of_year = month(month, label = TRUE, abbr = TRUE)) |> 
+         month_of_year = month(month, label = TRUE, abbr = TRUE)) |>
   # Add population density
   full_join(shape2 |> 
               st_drop_geometry() |> 
-              select(adm1_name, guid, guid_total_pop, guid_pop_dens), by = "guid") 
+              select(adm1_name, guid, guid_old, guid_total_pop, guid_pop_dens), by = c("guid" = "guid_old")) 
 
 # Note: Some denominators are imputed (all for 2021)
 
@@ -161,7 +169,7 @@ hist(tmp$diff)
 #    - Only excluded 6 due to missing guid so that's not it
   
 # Now fill in zero-counts for district/months with no afp notifications
-afp_agg <- mutate(afp_agg, across(c(n_afp:npev_afp_p), ~replace_na(., 0))) 
+afp_agg <- mutate(afp_agg, across(c(n_afp:ev_afp_p), ~replace_na(., 0))) 
 
 summary(afp_agg)
 
@@ -181,9 +189,9 @@ es = es_ %>%
          # Flag samples with any EV detected
          ev = !is.na(virus_type_s),
          # Define factor for NPEV positivity
-         npev_f = case_when(is.na(npev) ~ "NPEV-",
-                            !is.na(npev) ~ "NPEV+"), 
-         across(c(iso_3_code:site_id,sample_condition, npev, final_class), as.factor)) 
+         ev_f = case_when(!ev ~ "EV-",
+                            ev ~ "EV+"), 
+         across(c(iso_3_code:site_id,sample_condition, ev_f, final_class), as.factor)) 
 
 summary(es)
 
@@ -394,32 +402,15 @@ catch_wsh <- rename(catch_wsh, catchment_pop_nt = population) |>
 catch_wsh$catchment_pop_wpop <- exactextractr::exact_extract(poprast_proj,
                                                           catch_wsh, 
                                                           fun = "sum")  
-# Consists of vary many watersheds (partitioning the whole area in extracted tiles, not just attributed to sites?)
-# Can't directly identify which link to sites
-# Filter these before extracting other spatial covariates
-
-# # Surrounding geography
-# ## Precipitation
-# catch_wsh$precip21 <- exactextractr::exact_extract(rain_proj, 
-#                                                    catch_wsh, 
-#                                                    fun = "mean")  
-# ## Urbanicity - % built surface area
-# tmp <- extract(built_proj, catch_wsh, fun = mean)[,-1]
-# names(tmp) <- paste0("built",21:24)
-# 
-# catch_wsh <- cbind(catch_wsh, tmp) |> 
-#   mutate(across(starts_with("built"), \(x) x/(1000^2*area)))
-
-# Return to unprojected for consistency
 catch_wsh <- st_transform(catch_wsh, 4326)
 
-ggplot(catch_wsh |> pivot_longer(starts_with("catchment_pop_")), aes(value, fill = name)) + 
-  geom_density(alpha = 0.5) + 
-  scale_x_continuous(trans = "log")
-
-plot(log(catch_wsh$catchment_pop_nt), log(catch_wsh$catchment_pop_wpop))
-abline(0,1)
-# Novel-T populations somewhat smaller than populations extracted from wpop raster to the same polygons, and less varied.
+if (nrow(catch_wsh) > 0) {
+  ggplot(catch_wsh |> pivot_longer(starts_with("catchment_pop_")), aes(value, fill = name)) + 
+    geom_density(alpha = 0.5) + 
+    scale_x_continuous(trans = "log")
+  plot(log(catch_wsh$catchment_pop_nt), log(catch_wsh$catchment_pop_wpop))
+  abline(0,1)
+}
 
 # Connect sites/5k buffer to associated watersheds (where available)
 sites_wsh <- st_join(sites, catch_wsh, 
@@ -428,22 +419,25 @@ sites_wsh <- st_join(sites, catch_wsh,
   slice_head(n = 1) |> 
   left_join(select(st_drop_geometry(catch_5k), site_id, catchment_pop))
 
-plot(log(sites_wsh$catchment_pop), log(sites_wsh$catchment_pop_nt))
-abline(0,1)
-# Novel-T catchments overall smaller in pop size than 5km radius
-
-# tabyl(sites_wsh, site_id) |> View()
+if (nrow(sites_wsh) > 0 && "catchment_pop_nt" %in% names(sites_wsh)) {
+  plot(log(sites_wsh$catchment_pop), log(sites_wsh$catchment_pop_nt))
+  abline(0,1)
+}
 
 wsh_sites <- catch_wsh |>
   filter(!is.na(site)) |> 
   right_join(st_drop_geometry(sites_wsh |> select(site_id, id)))
 
-ggplot() +
-  geom_sf(data = shape2 |> filter(adm1_name == "AJK")) +
-  geom_sf(data = wsh_sites |> filter(grepl("PAK/AJ",site_id)),
-          aes(geometry = geometry), fill = "blue") +
-  geom_sf(data = sites_wsh |> filter(grepl("PAK/AJ",site_id)),
-          aes(geometry = geometry), col = "red")
+adm1_example <- unique(shape2$adm1_name)[1]
+site_pattern <- paste0(iso_code, "/")
+if (nrow(wsh_sites) > 0 && nrow(sites_wsh) > 0) {
+  ggplot() +
+    geom_sf(data = shape2 |> filter(adm1_name == adm1_example)) +
+    geom_sf(data = wsh_sites |> filter(grepl(site_pattern, site_id)),
+            aes(geometry = geometry), fill = "blue") +
+    geom_sf(data = sites_wsh |> filter(grepl(site_pattern, site_id)),
+            aes(geometry = geometry), col = "red")
+}
 # 
 # catch_wsh_dist <- st_intersection(catch_wsh, select(shape2, guid))
 # 

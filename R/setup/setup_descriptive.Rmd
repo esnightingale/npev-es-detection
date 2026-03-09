@@ -8,7 +8,8 @@ output: html_notebook
 pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
 theme_set(theme_minimal())
 
-dir <- "data/Pakistan/analysis"
+source(here("R/config.R"))
+dir <- file.path(dir, "analysis")
 figdir <- "figures/descriptive"
 
 # AFP data

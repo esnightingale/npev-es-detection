@@ -12,17 +12,18 @@ library(parsedate)
 library(tidyverse)
 library(sf)
 
+source(here("R/config.R"))
+
 # In/out directories
-subdir <- "Pakistan"
-datadir <- paste0("/Users/phpuenig/Dropbox/Polio-SPEC/Analysis/Data/polis/csv/",subdir) 
+datadir <- file.path(dropbox_polis, country)
 outdir <- "data"
 
 # Choose to include or exclude AFP cases with missing district
 impute_miss_adm <- FALSE 
 
-log_open(here(outdir,subdir,"./Cleaning/clean_polis.log"))
+log_open(here(outdir, country, "./Cleaning/clean_polis.log"))
 
-log_print(paste("POLIS data cleaning log for",subdir))
+log_print(paste("POLIS data cleaning log for", country))
 
 # ---------------------------------------------------------------------------- #
 # Additional helper functions
@@ -49,11 +50,11 @@ filename_shapes = paste0("/Users/phpuenig/Dropbox/Polio-SPEC/Analysis/Data/",
 
 shape2 <- st_read_geodb(filename_shapes,2) %>% 
   st_make_valid() |> 
-  filter(enddate > "2024-01-01", iso_3_code == "PAK") 
+  filter(enddate > "2024-01-01", iso_3_code == iso_code) 
 shape1 <- read_sf_geodb(filename_shapes,1) |> 
-  filter(enddate > "2024-01-01", iso_3_code == "PAK")
+  filter(enddate > "2024-01-01", iso_3_code == iso_code)
 shape0 <- read_sf_geodb(filename_shapes,0) |> 
-  filter(enddate > "2024-01-01", iso_3_code == "PAK")
+  filter(enddate > "2024-01-01", iso_3_code == iso_code)
 
 #---------------------------------------------------------------------------- #
 # NPAFP rate (for population denominator)
@@ -185,7 +186,7 @@ afp_miss_guid <- filter(afp, guid == "{NA}")
 afp_miss_guid %>% 
   select(epid, place_admin_1, place_admin_2, guid, x, y) 
 
-write_csv(afp_miss_guid, here(outdir,subdir,"Cleaning/afp_missing_adm2.csv"))
+write_csv(afp_miss_guid, here(outdir, country, "Cleaning/afp_missing_adm2.csv"))
 
 # => get guid from shapefile in which point falls if coordinates avaliable?
 
@@ -194,10 +195,10 @@ afp_miss_guid_sf <- filter(afp, guid == "{NA}") %>%
 
 # Plot to check
 ggplot() +
-  geom_sf(data = filter(shape2, iso_3_code == "PAK")) +
-  geom_sf(data= filter(afp_miss_guid_sf, iso_3_code == "PAK"), cex = 0.7) + 
+  geom_sf(data = filter(shape2, iso_3_code == iso_code)) +
+  geom_sf(data = filter(afp_miss_guid_sf, iso_3_code == iso_code), cex = 0.7) + 
   coord_sf()
-ggsave(here(outdir,subdir,"Cleaning/afp_missing_adm2.png"), height = 7, width = 8)
+ggsave(here(outdir, country, "Cleaning/afp_missing_adm2.png"), height = 7, width = 8)
 
 #### ----- INCLUDE OR EXCLUDE CASES WITH MISSING GUID ------ ####
 
@@ -296,15 +297,15 @@ es %>%
 # ---------------------------------------------------------------------------- #
 # Save cleaned datasets
 
-log_print(paste("Saving cleaned datasets in", here(outdir,subdir)))
+log_print(paste("Saving cleaned datasets in", here(outdir, country)))
 
-saveRDS(shape2, here(outdir,subdir,"shape2.rds"))
-saveRDS(shape1, here(outdir,subdir,"shape1.rds"))
-saveRDS(shape0, here(outdir,subdir,"shape0.rds"))
+saveRDS(shape2, here(outdir, country, "shape2.rds"))
+saveRDS(shape1, here(outdir, country, "shape1.rds"))
+saveRDS(shape0, here(outdir, country, "shape0.rds"))
 
-write_csv(afp, here(outdir,subdir,"linelist_afp_clean.csv"))
-write_csv(es, here(outdir,subdir,"linelist_es_clean.csv")) 
-write_csv(npafp, here(outdir,subdir,"npafp_clean.csv"))
+write_csv(afp, here(outdir, country, "linelist_afp_clean.csv"))
+write_csv(es, here(outdir, country, "linelist_es_clean.csv")) 
+write_csv(npafp, here(outdir, country, "npafp_clean.csv"))
 
 ################################################################################
 ################################################################################

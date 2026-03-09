@@ -7,8 +7,9 @@ pacman::p_load(tidyverse, here, gtsummary, sf, brms, tidybayes, bayesplot,
                units, loo, posterior, patchwork)
 theme_set(theme_minimal())
 
-dir <- "data/Pakistan/analysis/prevalence"
-outdir <- "output/prevalence/final"
+source(here::here("R/config.R"))
+dir <- file.path(dir, "analysis/prevalence")
+outdir <- file.path("output/prevalence", country)
 figdir <- "figures/prevalence/prediction"
 
 shape2 <- read_rds(here(dir,"../shape2.rds"))
