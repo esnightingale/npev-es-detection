@@ -35,95 +35,39 @@ es_ = read_csv(filename_es) |>
 npafp_ind <- read_csv(filename_npafp) |> 
   filter(between(month, tp[1], tp[2]))
 
-## Spatial data
-### District shapefiles
+### Spatial data
 shape2 <- readRDS(here(dir,"shape2.rds")) 
-
-### Population raster (WorldPop: pop_2021_CN_100m_R2025A or legacy ppp_2020_UNadj)
-pop_file <- list.files(here(dir, "WorldPop"), 
-                      pattern = paste0(raster_prefix, "_(pop_2021|ppp_.*UNadj).*\\.tif$"), 
-                      full.names = TRUE)
-if (length(pop_file) == 0) stop("Population raster not found in ", here(dir, "WorldPop"))
-# Prefer new format (pop_2021) over legacy (ppp_)
-pop_file <- pop_file[order(!grepl("pop_2021", pop_file))]
-poprast <- terra::rast(pop_file[1])
+poprast_proj <- rast(here(dir,"WorldPop", "proj_pop_rast.tif"))
+rain_proj <- rast(here(dir,"WorldPop", "proj_precip_rast.tif"))
+built_proj <- rast(here(dir,"WorldPop", "proj_built_rast.tif"))
 
 ### Novel-T watersheds (run R/setup/setup_watersheds.Rmd first; for Nigeria create data/Nigeria/Novel-T/ and run with country="Nigeria")
 watershed_path <- here(dir, "analysis/detection", "watershed.rds")
-if (!file.exists(watershed_path)) {
-  stop("Watershed file not found at ", watershed_path, 
-       ". Run R/setup/setup_watersheds.Rmd first, or create analysis/detection/ and add watershed.rds.")
+if (file.exists(watershed_path)) {
+  catch_wsh <- readRDS(watershed_path)
+} else {
+  message("Watershed file not found at ", watershed_path, 
+          ". Using 5km buffers only. Run R/setup/setup_watersheds.Rmd for watershed catchments.")
+  # Empty sf without site_id to avoid duplicate column names in st_join
+  catch_wsh <- st_sf(id = integer(0), population = numeric(0), geometry = st_sfc(crs = 4326))
 }
-catch_wsh <- readRDS(watershed_path)
-
-### Annual mean precipitation https://hub.worldpop.org/doi/10.5258/SOTON/WP00772 
-rain_file <- list.files(here(dir, "WorldPop"), pattern = paste0(raster_prefix, "_ppt_.*\\.tif$"), full.names = TRUE)
-if (length(rain_file) == 0) stop("Precipitation raster not found in ", here(dir, "WorldPop"))
-rain <- terra::rast(rain_file[1])
-
-### Built up surface https://hub.worldpop.org/doi/10.5258/SOTON/WP00772 
-f <- list.files(here(dir, "WorldPop"), 
-                full.names = T,
-                pattern = paste0(raster_prefix, "_built_.*\\.tif$"))
-if (length(f) == 0) stop("Built-up raster(s) not found in ", here(dir, "WorldPop"))
-built <- terra::rast(f)
 
 ################################################################################
 # Set up data for analysis ------------------------------------------------
 
-# Shapefiles --------------------------------------------------------------
-
-## Projected data
-shape2_proj <- st_transform(shape2, proj_local) 
-poprast_proj <- terra::project(poprast, proj_local)
-rain_proj <- terra::project(rain, proj_local)
-built_proj <- terra::project(built, proj_local) 
-
-# Define district area in km2
-shape2$shape_area_km2  <- st_area(shape2_proj) |> units::set_units("km^2")
-hist(shape2$shape_area_km2)
-summary(shape2$shape_area_km2)
-
-## Extract total district populations from raster
-shape2$guid_total_pop <- exactextractr::exact_extract(poprast_proj,
-                                                 shape2_proj, 
-                                                 fun = "sum") 
-
-# Define district population density
-shape2$guid_pop_dens <- shape2$guid_total_pop/shape2$shape_area_km2
-hist(shape2$guid_pop_dens)  
-summary(shape2$guid_pop_dens)
-
-# Set up simpler guid to avoid later parsing issues
-shape2$guid_old <- shape2$guid
-shape2$guid <- factor(shape2$guid_old, 
-                      levels = unique(shape2$guid_old),
-                      labels = 1:nrow(shape2))
-
-# Define spatial adjacency matrix (for BYM model)
-nb <- spdep::poly2nb(shape2)  
-W <- spdep::nb2mat(nb, style = "B", zero.policy = TRUE) |> as.matrix() 
-rownames(W) <- shape2$guid
-
-# ggplot(shape2) +
-#   geom_sf(aes(fill = as.numeric(guid_pop_dens))) +
-#   scale_fill_viridis_c(name = paste0("Pop Density (", 
-#                                      deparse_unit(shape2$guid_pop_dens), ")"),
-#                        trans = "log10",
-#                        labels = scales::comma) +
-#   theme_void()
-
 # AFP data ----------------------------------------------------------------
 
 afp <- afp_ |> 
-  # Distinguish polio and non-polio cases
-  # - To examine NPEV among NP-AFP, not PV-AFP cases due to masking
-  # Also flag *any* EV detection (incl. wild/VDPV/vaccine/npev)
-  # - To align with official ES indicator of EV detection
-  mutate(npafp = !(grepl("WILD", virus_type_s) | grepl("VDPV",virus_type_s)),
-         ev = !is.na(virus_type_s)) |> 
-  # exclude AFP among over-15s 
-  filter(age_m < 15*12) 
+  # Flag 
+  # - *any* EV detection (poliovirus, vaccine, or NPEV) 
+  # - NPEV (with or without PV)
+  # - PV only (PV or vaccine, without NPEV)
+  # Distinguish polio vs non-polio for denominator/rate calculations
+  mutate(month_of_year = month(month, label = TRUE, abbr = TRUE),
+         ev = !is.na(virus_type_s),
+         npev = grepl("NPEV", virus_type_s),
+         pv_only = ev & !npev,
+         npafp = !pv_only) 
 
 # # Check AFP data has all districts/months:
 # tmp <- expand.grid(
@@ -135,41 +79,27 @@ afp_agg <- afp |>
   # Aggregate to district and month
   group_by(guid, month) |> 
   summarise(n_afp = n(),
-            n_npafp = sum(npafp, na.rm = T),
-            n_ev = sum(ev, na.rm = T),
-            n_npev = sum(npev == "Yes", na.rm = T),
-            n_wpv = sum(grepl("WILD", virus_type_s))) |> 
+            n_npafp = sum(npafp),
+            n_ev = sum(ev),
+            n_npev = sum(npev, na.rm = T),
+            n_pv_only = sum(pv_only)) |> 
   ungroup() |> 
   # Join with U15 population denominator, expanding to all districts/months
   right_join(npafp_ind) |> 
   # Define rate/prevalence variables of interest and time indicators
-  mutate(npafp_r = n_npafp*1e5/denominator,
-         npev_npafp_p = n_npev/n_npafp,
-         npev_afp_p = n_npev/n_afp,
-         ev_afp_p = n_ev/n_afp,
-         t = as.numeric(as.factor(period)),
-         month_of_year = month(month, label = TRUE, abbr = TRUE)) |>
+  mutate(npafp_rate = n_npafp*1e5*12/denominator,
+         ev_afp_p = n_ev/n_afp) |>
+  rename(guid_old = guid) |> 
   # Add population density
   full_join(shape2 |> 
               st_drop_geometry() |> 
-              select(adm1_name, guid, guid_old, guid_total_pop, guid_pop_dens), by = c("guid" = "guid_old")) 
+              select(adm1_name, guid, guid_old, guid_total_pop, guid_pop_dens)) 
 
-# Note: Some denominators are imputed (all for 2021)
-
-# Check agreement of npafp numerator and tallied npafp case records:
-afp_agg |> 
-  mutate(check = n_npafp == numerator,
-         diff = n_npafp - numerator) -> tmp
-
-tabyl(tmp$check)
-hist(tmp$diff)
-
-# => Most differences are small, generally numerator > tallied records 
-#    - Could be slight differences in the way we've defined polio cases?
-#    - Only excluded 6 due to missing guid so that's not it
-  
-# Now fill in zero-counts for district/months with no afp notifications
-afp_agg <- mutate(afp_agg, across(c(n_afp:ev_afp_p), ~replace_na(., 0))) 
+# Now fill in zero-counts for district/months with no afp notifications, and
+# add time variables
+afp_agg <- mutate(afp_agg, across(c(n_afp:ev_afp_p), ~replace_na(., 0)),
+                  t = as.numeric(as.factor(period)),
+                  month_of_year = month(month, label = TRUE, abbr = TRUE)) 
 
 summary(afp_agg)
 
@@ -178,39 +108,39 @@ summary(afp_agg)
 es = es_ %>% 
   dplyr::select(iso_3_code,admin_1,admin_2,guid,
                 site_id, site_name, x, y, coord_imp,
-                collection_date, travel_time, sample_condition, final_class,
+                collection_date, travel_time, sample_condition,
                 npev, virus_type_s, virus_cluster_s, emergence_group_s) |>
-  # Define additional time variables, PV/NPEV positivity and site type
-  mutate(month = floor_date(collection_date, "month"),
+  # Define additional time variables, PV/EV positivity and site type
+  mutate(site_name = toupper(site_name),
+         month = floor_date(collection_date, "month"),
          month_of_year = month(collection_date, label = T),
          year = year(month),
-         # Flag samples with virulent poliovirus detected (excl. vaccine)
-         pv = grepl("WILD",virus_type_s) | grepl("PV", virus_type_s),
-         # Flag samples with any EV detected
          ev = !is.na(virus_type_s),
-         # Define factor for NPEV positivity
+         npev = grepl("NPEV", virus_type_s),
+         pv_only = ev & !npev,
+         # Define factor for EV positivity
          ev_f = case_when(!ev ~ "EV-",
                             ev ~ "EV+"), 
-         across(c(iso_3_code:site_id,sample_condition, ev_f, final_class), as.factor)) 
+         across(c(iso_3_code:site_id,sample_condition, ev_f), as.factor)) 
 
 summary(es)
 
 # ES sites 
-
 sites <- es |> 
-  mutate(type = case_when((grepl("PUMPING",site_name)|
-                             (grepl("PUMP", site_name) & grepl("STATION", site_name))|
-                             grepl("PLANT", site_name)) ~ "WWTP or Pumping station",
+  mutate(type = case_when(grepl("TREATMENT",site_name) | grepl("PLANT", site_name) |
+                             (grepl("PUMP", site_name) & grepl("STATION", site_name)) ~ "WWTP or Pumping station",
                           TRUE ~ "Other") |> 
       factor(levels = c("WWTP or Pumping station","Other"))) |> 
   group_by(guid, site_id, site_name, x, y, coord_imp, type) |> 
   summarise(first = min(collection_date),
             first_y = year(first),
             total = n(),
-            p_wpv = mean(final_class == "WPV1"),
-            p_npev = mean(!is.na(npev)),
+            p_pv_only = mean(pv_only),
+            p_npev = mean(npev),
             p_ev = mean(ev)) |> 
   ungroup() |> 
+  # Exclude samples from unmapped sites
+  filter(!is.na(x)) |> 
   st_as_sf(coords = c("x","y"), crs = 4326, remove = F) 
 
 tabyl(sites$type)
@@ -370,6 +300,7 @@ catch_5k$catchment_pop <- exactextractr::exact_extract(poprast_proj,
 
 # Also categorise by radial catchment size
 catch_5k$catchment_cat <- factor(catch_5k$catchment_pop > 1e5, 
+                                 levels = c(FALSE,TRUE),
                                     labels = c("<100,000", ">100,000"))
 
 tabyl(catch_5k$catchment_cat)
@@ -383,8 +314,8 @@ catch_5k$precip21 <- exactextractr::exact_extract(rain_proj,
                                                   catch_5k, 
                                                   fun = "mean")  
 ## Urbanicity - % built surface area
-tmp <- terra::extract(built_proj, catch_5k, fun = sum)[,-1]
-names(tmp) <- paste0("built",21:24)
+tmp <- terra::extract(built_proj, catch_5k, fun = sum, na.rm = T)[,-1]
+names(tmp) <- paste0("built",years[1]:years[2])
 
 area_5k <- st_area(catch_5k)[1]
 catch_5k <- cbind(catch_5k, tmp) |> 
@@ -394,17 +325,16 @@ catch_5k <- cbind(catch_5k, tmp) |>
 catch_5k <- st_transform(catch_5k, 4326)
 
 # Catchments: Watershed ---------------------------------------------------
-
-# Rename novel-t population estimate for consistency, then also extract estimate from worldpop raster
-catch_wsh <- rename(catch_wsh, catchment_pop_nt = population) |> 
-  st_transform(proj_local)
-
-catch_wsh$catchment_pop_wpop <- exactextractr::exact_extract(poprast_proj,
-                                                          catch_wsh, 
-                                                          fun = "sum")  
-catch_wsh <- st_transform(catch_wsh, 4326)
+# Currently bugged for Pakistan watersheds - leaving for now as not currently using
 
 if (nrow(catch_wsh) > 0) {
+  # Rename novel-t population estimate for consistency, then also extract estimate from worldpop raster
+  catch_wsh <- rename(catch_wsh, catchment_pop_nt = population) |> 
+    st_transform(proj_local)
+  catch_wsh$catchment_pop_wpop <- exactextractr::exact_extract(poprast_proj,
+                                                            catch_wsh, 
+                                                            fun = "sum")  
+  catch_wsh <- st_transform(catch_wsh, 4326)
   ggplot(catch_wsh |> pivot_longer(starts_with("catchment_pop_")), aes(value, fill = name)) + 
     geom_density(alpha = 0.5) + 
     scale_x_continuous(trans = "log")
@@ -414,9 +344,11 @@ if (nrow(catch_wsh) > 0) {
 
 # Connect sites/5k buffer to associated watersheds (where available)
 sites_wsh <- st_join(sites, catch_wsh, 
-                       st_is_within_distance, dist = set_units(100,"m")) |> 
-  group_by(site_id) |> 
-  slice_head(n = 1) |> 
+                       st_is_within_distance, dist = set_units(100,"m"))
+if (nrow(catch_wsh) > 0) {
+  sites_wsh <- sites_wsh |> group_by(site_id) |> slice_head(n = 1) |> ungroup()
+}
+sites_wsh <- sites_wsh |> 
   left_join(select(st_drop_geometry(catch_5k), site_id, catchment_pop))
 
 if (nrow(sites_wsh) > 0 && "catchment_pop_nt" %in% names(sites_wsh)) {
@@ -424,9 +356,13 @@ if (nrow(sites_wsh) > 0 && "catchment_pop_nt" %in% names(sites_wsh)) {
   abline(0,1)
 }
 
-wsh_sites <- catch_wsh |>
-  filter(!is.na(site)) |> 
-  right_join(st_drop_geometry(sites_wsh |> select(site_id, id)))
+wsh_sites <- if (nrow(catch_wsh) > 0 && "site" %in% names(catch_wsh)) {
+  catch_wsh |>
+    filter(!is.na(site)) |> 
+    right_join(st_drop_geometry(sites_wsh |> select(site_id, id)))
+} else {
+  st_sf(geometry = st_sfc(crs = 4326))
+}
 
 adm1_example <- unique(shape2$adm1_name)[1]
 site_pattern <- paste0(iso_code, "/")
@@ -455,6 +391,8 @@ if (nrow(wsh_sites) > 0 && nrow(sites_wsh) > 0) {
 # Save analysis datasets --------------------------------------------------
 
 outdir <- paste0(dir,"/analysis")
+dir.create(here(outdir, "prevalence"), recursive = TRUE, showWarnings = FALSE)
+dir.create(here(outdir, "detection"), recursive = TRUE, showWarnings = FALSE)
 
 # AFP cases
 saveRDS(afp, here(outdir, "prevalence/afp_linelist.rds"))
@@ -467,21 +405,6 @@ saveRDS(sites, here(outdir, "detection/sites_analysis.rds"))
 # Catchment shapefiles and population sizes
 saveRDS(catch_5k, here(outdir,"detection/catch_5k.rds"))
 saveRDS(catch_wsh, here(outdir,"detection/catch_wsh.rds"))
-
-# Shapefiles
-saveRDS(shape2, here(outdir, "shape2.rds"))
-saveRDS(W, here(outdir, "W.rds"))
-
-# Projected rasters
-writeRaster(poprast_proj, 
-            here(dir,"WorldPop", "proj_pop_rast.tif"), 
-                 overwrite=T)
-writeRaster(rain_proj, 
-            here(dir,"WorldPop", "proj_precip_rast.tif"), 
-            overwrite=T)
-writeRaster(built_proj, 
-            here(dir,"WorldPop", "proj_built_rast.tif"), 
-            overwrite=T)
 
 ################################################################################
 ################################################################################

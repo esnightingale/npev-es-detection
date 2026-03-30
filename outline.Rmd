@@ -34,7 +34,7 @@ Raw files:
   - District
   - Denominator (U15 pop)
   
-Need to flag if sample positive for both poliovirus and non-polio enterovirus (NPEV)?
+Want to flag any EV positive, i.e. where sample positive for either poliovirus or non-polio enterovirus (NPEV)
   - Presence of poliovirus can mask NPEV growth in flask culture
 
 ## Data setup
@@ -47,14 +47,14 @@ Analysis datasets:
   - Sample ID
   - Month of collection
   - Year of collection
-  - NPEV positive (Y/N)
+  - EV positive (Y/N)
   - Poliovirus positive (Y/N)
 + AFP cases
   - District 
   - NPAFP denominator
   - Month of notification
   - Year of notification
-  - NPEV positive count
+  - EV positive count
   - Poliovirus positive count
 
 ## Analysis
@@ -63,31 +63,9 @@ Analysis datasets:
 
 + Number of samples collected, total and monthly
 + Map location of unique sites
-+ Proportion of samples NPEV+
++ Proportion of samples EV+
 
 + Number of AFP cases reported, total and monthly
 + District rate of NPAFP cases per 100,000 U15 population, total and monthly
-+ Proportion of AFP cases NPEV+
++ Proportion of AFP cases EV+
 + District average population density
-
-### Model setup
-
-1. NPEV prevalence model
-
-Number of NPEV+ AFP cases in district $i$ at time $t$:
-
-$$ Y_{i,t} \sim  Binomial(M_{i,t}, p_{i,t}) $$
-where $M_{i,t}$ is the number of notified AFP cases and $p_{i,t}$ is the prevalence of NPEV in this population (to be estimated).
-
-$$ logit(p_{i,t}) = \beta_0 + \beta_1*[popdens] + f^{BYM}(i) + f^{cc}(month(t)) + f^{RW1}(t)$$
-Fit this using brms with BYM spatial random effect, AR1 and RW1 temporal effects. Extract predicted prevalence for each district at each time point and associated standard error. 
-
-2. ES detection model
-
-Binary detection of NPEV in sample $j$ from site $s$ at time $t$:
-
-$$ X_{j,s,t} \sim  Bernoulli(q_{j,s,t}) $$
-
-where $q_{j,s,t}$ is the probability of detecting NPEV, given district prevalence $p_{i,t}$.
-
-$$ logit(q_{j,s,t}) = \gamma_0 + \gamma_s*log(p_{i,t}) + f_{s,t}(month(t)) $$

@@ -13,8 +13,8 @@ theme_set(theme_minimal())
 
 source(here("R/config.R"))
 dir <- file.path(dir, "analysis")
-outdir <- file.path("output/prevalence", country)
-figdir <- "figures/prevalence/fit"
+outdir <- file.path("output", country)
+figdir <- here("figures",country,"descriptive/afp")
 
 source(here("R/utils/check_model_fit.R"))
 source(here("R/utils/plot_re_fcns.R"))
@@ -26,14 +26,14 @@ fitdata <- read_rds(here(dir,"prevalence/fitdata.rds"))
 preddata <- read_rds(here(dir,"prevalence/preddata.rds"))
 
 # Shapefiles
-shape2 <- read_rds(here(dir,"shape2.rds"))
-W <- read_rds(here(dir, "W.rds"))
+shape2 <- read_rds(here(dir,"../shape2.rds"))
+W <- readRDS(here(dir, "W.rds"))
 
 # Selected model
-# fit_prior <- read_rds(here(outdir,"fit_prior.rds"))
-# fit <- read_rds(here(outdir,"fit_posterior.rds"))
-fit_prior <- read_rds(here(outdir,"prior_bym_st_guid.rds"))
-fit <- read_rds(here(outdir,"fit_bym_st_guid.rds"))
+fit_prior <- read_rds(here(outdir,"prevalence/fit_prior.rds"))
+fit <- read_rds(here(outdir,"prevalence/fit_posterior.rds"))
+# fit_prior <- read_rds(here(outdir,"prior_bym_st_guid.rds"))
+# fit <- read_rds(here(outdir,"fit_bym_st_guid.rds"))
 
 # Define adm1-guid key for later matching:
 prov_guid <- fitdata |> 
@@ -74,7 +74,7 @@ ggsave(here(figdir,"prior_sample.png"),
 ```{r}
 
 mcmc_trace(fit, 
-           pars = get_variables(fit)[1:9],
+           pars = get_variables(fit)[1:11],
            facet_args = list(nrow = 2))
 ggsave(here(figdir,"mcmc_trace.png"),
        height = 4, width = 8, bg = "white")
@@ -289,12 +289,12 @@ ggsave(here(figdir,"time_longterm.png"),
 #### By district
 ```{r}
 
-p_lt_d_ <- ggplot_build(tmp[[2]])
+p_lt_d_ <- ggplot_build(tmp[[3]])
 
-p_lt_d_$plot$data |> 
-  mutate(effect1__ = (effect1__*47)+1) |>  
-  rename(District = guid) |> 
-  ggplot(mapping = p_lt_d_$plot$mapping) + 
+p_lt_d_$plot$data |>
+  mutate(effect1__ = (effect1__*47)+1) |> 
+  rename(District = guid) |>
+  ggplot(mapping = p_lt_d_$plot$mapping) +
   geom_ribbon(aes(group = District), alpha = 0.01, fill = "grey60", col = NA) +
   geom_line(aes(group = District), alpha = 0.2, col = "#3366FF") +
   guides(col = "none",fill = "none") +
@@ -302,7 +302,7 @@ p_lt_d_$plot$data |>
   labs(x = NULL, y = "District-specific deviation") -> p_lt_comb
 
 p_lt_comb
-ggsave(here(figdir,"time_longterm_district.png"), 
+ggsave(here(figdir,"time_longterm_district.png"),
        height = 5, width = 7, bg = "white")
 
 ```
@@ -310,7 +310,7 @@ ggsave(here(figdir,"time_longterm_district.png"),
 ### Season
 ```{r}
 
-p_season <- ggplot_build(tmp[[3]])
+p_season <- ggplot_build(tmp[[2]])
 
 p_season$plot$data |> 
   mutate(effect1__ = (effect1__*11)+1) |>  

@@ -12,13 +12,14 @@ pacman::p_load(tidyverse, here, gtsummary, sf, spdep, patchwork)
 theme_set(theme_minimal())
 
 source(here("R/config.R"))
-figdir <- "figures/descriptive/afp"
+figdir <- here("figures",country,"descriptive/afp")
+plotdir <- here("figures",country,"descriptive/afp/plotobj")
 
 # NP-AFP analysis data
 data <- readRDS(here(dir, "analysis/prevalence/afp_analysis.rds"))
 
 # Shapefiles and adjacency matrix
-shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+shape2 <- readRDS(here(dir,"shape2.rds"))
 
 ```
 
@@ -27,15 +28,13 @@ shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
 ```{r}
 
 data |> 
-  tbl_summary(include = c(n_afp, n_npafp, npafp_r, n_ev, ev_afp_p, n_npev, npev_npafp_p),
+  tbl_summary(include = c(n_afp, n_npafp, polis_npafp_rate, n_ev, ev_afp_p),
               by = year,
-              label = list(n_afp = "AFP notifications", 
-                           n_npafp = "Non-polio AFP notifications", 
-                           npafp_r = "Non-polio AFP rate (per 100,000 U15s)", , 
+              label = list(n_afp = "AFP notifications per month", 
+                           n_npafp = "Non-polio AFP notifications per month", 
+                           polis_npafp_rate = "12m non-polio AFP rate (per 100,000 U15s)", 
                            n_ev = "EV positives", 
-                           ev_afp_p = "Crude EV prevalence",
-                           n_npev = "NPEV positives", 
-                           npev_npafp_p = "Crude NPEV prevalence")) |> 
+                           ev_afp_p = "% EV positivity")) |> 
   add_overall() |> 
   as_gt()
 
@@ -52,11 +51,11 @@ data |>
   pivot_longer(n_afp:n_npafp) |> 
   mutate(name = factor(name, labels = c("AFP","NP-AFP")),
          r = value*1e5/denominator) |> 
-  rowwise() |> 
-  mutate(lo = Hmisc::binconf(value, denominator)[2]*1e5,
-         hi = Hmisc::binconf(value, denominator)[3]*1e5) |>
-  ggplot(aes(month, r, ymin = lo, ymax = hi)) +
-  geom_ribbon(alpha = 0.2) +
+  # rowwise() |> 
+  # mutate(lo = Hmisc::binconf(value, denominator)[2]*1e5,
+  #        hi = Hmisc::binconf(value, denominator)[3]*1e5) |>
+  ggplot(aes(month, r)) + #, ymin = lo, ymax = hi
+  # geom_ribbon(alpha = 0.2) +
   geom_line(aes(lty = name, col = name)) + 
   guides(color = guide_legend(NULL),
          lty = guide_legend(NULL)) +
@@ -70,9 +69,9 @@ data |>
   group_by(month) |> 
   summarise(afp = sum(n_afp),
             npafp = sum(n_npafp),
-            pv = afp - npafp) |> 
+            pv = sum(n_pv_only)) |> 
   pivot_longer(npafp:pv) |> 
-  mutate(name = factor(name, labels = c("Non-polio","Polio"))) |> 
+  mutate(name = factor(name, labels = c("Non-polio","Polio/Sabin"))) |> 
   ggplot(aes(month, value, fill = name)) +
   geom_col(position = position_dodge()) +
   scale_fill_manual(values = c("grey", "black")) +
@@ -85,15 +84,14 @@ data |>
   group_by(guid, year) |> 
   summarise(n_afp = sum(n_afp),
             n_ev = sum(n_ev),
-            r_ev = n_ev/n_afp) |>
-  ungroup() |>
-  right_join(shape2) |> 
+            r_ev = n_ev/n_afp) |> 
+  ungroup() |> 
+  right_join(shape2) |> View()
   ggplot(aes(fill = r_ev, geometry = SHAPE)) + 
   geom_sf(col = NA) +
   facet_wrap(~year) +
   scale_fill_viridis_c(name = "EV+\nPrevalence", trans = "sqrt") + 
   theme_void() -> p_dist_yr
-
 
 # Longer term trend, by province
 data |> 
@@ -138,15 +136,18 @@ data |>
             `EV+` = sum(n_ev),
             `EV-` = n_afp - `EV+`,
             p_ev = `EV+`*100/n_afp) |>
-  ungroup() |> 
+  ungroup() -> data_mth
+
+m <- max(data_mth$n_afp)/max(data_mth$p_ev) |> round()
+data_mth |> 
   pivot_longer(`EV+`:`EV-`) |>
   ggplot() + 
   geom_col(aes(x = month_of_year, y = value,  fill = name)) +
-  geom_line(aes(x = month_of_year, y = p_ev*150, group = 1),
+  geom_line(aes(x = month_of_year, y = p_ev*m, group = 1),
             col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
   scale_fill_manual(values = c("grey","grey50")) +
   scale_y_continuous(name = "Notified AFP cases",
-                     sec.axis = sec_axis(trans=~./150,
+                     sec.axis = sec_axis(trans=~./m,
                                          name = NULL)) +
   theme(legend.position = c(0.2,0.9)) +
   labs(x = "Paralysis onset month", y = "Count", fill = NULL) -> p_moy
@@ -210,10 +211,10 @@ Overall decrease year on year, with more pronounced seasonality in 2021.
 ```{r}
 
 p_moy + p_moy_yr + 
-  plot_annotation(tag_levels = "A") -> p_seas_npev
+  plot_annotation(tag_levels = "A") -> p_seas_ev
 
-p_seas_npev
-saveRDS(p_seas_npev, here(figdir,"plotobj/ev_seas.png"))
+p_seas_ev
+saveRDS(p_seas_ev, here(plotdir,"ev_seas.rds"))
 ggsave(here(figdir,"ev_seas.png"),
        height = 4, width = 10, bg = "white")
 

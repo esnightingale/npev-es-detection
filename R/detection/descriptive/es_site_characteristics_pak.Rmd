@@ -815,7 +815,7 @@ Distinct bump in NPEV-positivity during early summer.
 
 ```{r}
 
-plot_es_npev_pos <- function(yr){
+plot_es_ev_pos <- function(yr){
  ggplot() + 
   geom_sf(data = shape0 |> st_transform(4326)) + 
   geom_sf(data = st_jitter(filter(es_pt_mth, year == yr), factor = 0.0005), 
@@ -832,7 +832,7 @@ plot_es_npev_pos <- function(yr){
   return(p)
 }
 
-lapply(c(2021:2024), plot_es_npev_pos)
+lapply(c(2021:2024), plot_es_ev_pos)
 
 ```
 
@@ -859,7 +859,7 @@ decreasing with a small bump in June.
 
 ```{r}
 
-plot_es_npev_pos <- function(yr){
+plot_es_ev_pos <- function(yr){
  ggplot() + 
   geom_sf(data = shape0 |> st_transform(4326)) + 
   geom_sf(data = st_jitter(filter(es_sf, year == yr), factor = 0.0005), 
@@ -876,7 +876,7 @@ plot_es_npev_pos <- function(yr){
   return(p)
 }
 
-lapply(c(2021:2024), plot_es_npev_pos)
+lapply(c(2021:2024), plot_es_ev_pos)
 
 ```
 

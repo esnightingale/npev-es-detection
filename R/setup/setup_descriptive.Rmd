@@ -10,7 +10,7 @@ theme_set(theme_minimal())
 
 source(here("R/config.R"))
 dir <- file.path(dir, "analysis")
-figdir <- "figures/descriptive"
+figdir <- here("figures",country,"descriptive/afp")
 
 # AFP data
 afp <- readRDS(here(dir, "prevalence/afp_linelist.rds"))
@@ -20,7 +20,7 @@ es <- readRDS(here(dir, "detection/es_analysis.rds"))
 sites <- readRDS(here(dir, "detection/sites_analysis.rds"))
 
 # Shapefiles and adjacency matrix
-shape2 <- readRDS(here(dir,"shape2.rds")) |> st_transform(4326)
+shape2 <- readRDS(here(dir,"../shape2.rds"))
 
 # Define a minimum site sample size for analysis 
 min_ss = 10
@@ -127,14 +127,16 @@ afp |>
             `EV-` = n - `EV+`,
             p_ev = `EV+`*100/n) |>
   ungroup() |> 
-  pivot_longer(`EV+`:`EV-`) |>
-  ggplot() + 
+  pivot_longer(`EV+`:`EV-`) -> plotdat_afp
+
+ymax1 <- max(plotdat_afp$n)
+ggplot(plotdat_afp) + 
   geom_col(aes(x = month, y = value,  fill = name)) +
-  geom_line(aes(x = month, y = p_ev*21, group = 1),
+  geom_line(aes(x = month, y = (p_ev / 100) * ymax1, group = 1),
             col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
   scale_fill_manual(values = c("grey","grey50")) +
   scale_y_continuous(name = "Notified AFP cases",
-                     sec.axis = sec_axis(trans=~./21,
+                     sec.axis = sec_axis(trans=~ (. / ymax1) * 100,
                                          name = "% positive")) +
   theme(legend.position = c(0.2,0.9)) +
   labs(x = NULL, y = "Count", fill = NULL, 
@@ -147,14 +149,16 @@ es |>
             `EV-` = n - `EV+`,
             p_ev = `EV+`*100/n) |>
   ungroup() |> 
-  pivot_longer(`EV+`:`EV-`) |>
-  ggplot() + 
+  pivot_longer(`EV+`:`EV-`) -> plotdat_es
+
+ymax2 <- max(plotdat_es$n)
+ggplot(plotdat_es) + 
   geom_col(aes(x = month, y = value,  fill = name)) +
-  geom_line(aes(x = month, y = p_ev*3, group = 1),
+  geom_line(aes(x = month, y = (p_ev / 100) * ymax2, group = 1),
             col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
   scale_fill_manual(values = c("grey","grey50")) +
   scale_y_continuous(name = "Collected ES samples",
-                     sec.axis = sec_axis(trans=~./3,
+                     sec.axis = sec_axis(trans=~ (. / ymax2) * 100,
                                          name = "% positive")) +
   theme(legend.position = c(0.2,0.9)) +
   labs(x = NULL, y = "Count", fill = NULL,
@@ -162,9 +166,32 @@ es |>
 
 p_ev_afp / p_ev_es
 ggsave(here(figdir, "ev_afp_es.png"), height = 7, width = 7, bg = "white")
+
 ```
 
 ```{r}
+
+afp |> 
+  group_by(month_of_year) |> 
+  summarise(n = n(),
+            `EV+` = sum(ev),
+            `EV-` = n - `EV+`,
+            p_ev = `EV+`*100/n) |>
+  ungroup() |> 
+  pivot_longer(`EV+`:`EV-`) -> plotdat_afp
+  
+ymax1 <- max(plotdat_afp$n, na.rm = TRUE)
+ggplot(plotdat_afp) + 
+  geom_col(aes(x = month_of_year, y = value,  fill = name)) +
+  geom_line(aes(x = month_of_year, y = (p_ev / 100) * ymax1, group = 1),
+            col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
+  scale_fill_manual(values = c("grey","grey50")) +
+  scale_y_continuous(name = "Notified AFP cases",
+                     sec.axis = sec_axis(trans=~ (. / ymax1) * 100,
+                                         name = "% positive")) +
+  theme(legend.position = c(0.2,0.8), legend.background = element_rect("white")) +
+  labs(x = NULL, y = "Count", fill = NULL, 
+       subtitle = "EV detection in AFP samples") -> p_afp_moy
 
 es |> 
   group_by(month_of_year) |> 
@@ -173,19 +200,22 @@ es |>
             `EV-` = n - `EV+`,
             p_ev = `EV+`*100/n) |>
   ungroup() |> 
-  pivot_longer(`EV+`:`EV-`) |>
-  ggplot() + 
+  pivot_longer(`EV+`:`EV-`) -> plotdat_es
+  
+ymax2 <- max(plotdat_es$n, na.rm = TRUE)
+ggplot(plotdat_es) + 
   geom_col(aes(x = month_of_year, y = value,  fill = name)) +
-  geom_line(aes(x = month_of_year, y = p_ev*1, group = 1),
+  geom_line(aes(x = month_of_year, y = (p_ev / 100) * ymax2, group = 1),
             col = viridis::mako(5, end = 0.8)[3], lwd = 1) +
   scale_fill_manual(values = c("grey","grey50")) +
   scale_y_continuous(name = "Collected ES samples",
-                     sec.axis = sec_axis(trans=~./1,
+                     sec.axis = sec_axis(trans=~ (. / ymax2) * 100,
                                          name = NULL)) +
-  theme(legend.position = c(0.2,0.9)) +
-  labs(x = "Collection month", y = "Count", fill = NULL) -> p_moy
+  theme(legend.position = c(0.2,0.8), legend.background = element_rect("white")) +
+  labs(x = "Collection month", y = "Count", fill = NULL) -> p_es_moy
 
-p_moy
+p_afp_moy
+p_es_moy
 
 ```
 
@@ -206,11 +236,11 @@ ggplot(ev_site_yr, aes(ev_p)) +
   facet_wrap(~year)
 
 ev_site_yr |> 
-  tbl_summary(include = c(n, ev, ev_p, ev_neg),
+  tbl_summary(include = c(n, ev, ev_p),
               by = year,
               label = list(n = "Samples collected", 
                            ev = "EV positive", 
-                           ev_neg = "EV negative",
+                           # ev_neg = "EV negative",
                            ev_p = "Proportion EV positive")) |> 
   add_overall() |> 
   as_gt()

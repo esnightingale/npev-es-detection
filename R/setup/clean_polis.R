@@ -1,6 +1,7 @@
 ################################################################################
 # Read and tidy raw POLIS downloads for AFP cases and ES samples
 # + Select / setup vars of interest
+# + virus_type_ord_1..5 and virus_type_n_unique from virus_type_s (AFP + ES)
 # + Impute missing coordinates with district centroids
 # + Define additional variables (classify sites by sampling regularity)
 # + No subsetting by time/country
@@ -16,7 +17,7 @@ source(here("R/config.R"))
 
 # In/out directories
 datadir <- file.path(dropbox_polis, country)
-outdir <- "data"
+outdir <- here("data",country)
 
 # Choose to include or exclude AFP cases with missing district
 impute_miss_adm <- FALSE 
@@ -40,28 +41,89 @@ date_to_period = function(x){
 }
 
 # ---------------------------------------------------------------------------- #
+# virus_type_s: five logical indicators (fixed POLIS reporting order / groupings)
+# 1 NPEV, 2 Sabin/vaccine (VACCINE*), 3 VDPV (cVDPV / aVDPV / VDPV*), 4 wild (WILD*),
+# 5 other non-empty tokens not in 1–4. Missing/empty virus_type_s -> all FALSE.
+# Plus virus_type_n_unique = count of distinct trimmed tokens (0 if missing/empty).
+
+parse_virus_type_tokens <- function(x) {
+  if (is.null(x) || length(x) == 0L) {
+    return(character(0))
+  }
+  x <- x[1]
+  if (is.na(x)) {
+    return(character(0))
+  }
+  x <- str_trim(as.character(x))
+  if (!nzchar(x)) {
+    return(character(0))
+  }
+  parts <- unlist(strsplit(x, ",", fixed = TRUE))
+  parts <- str_trim(parts)
+  parts[nzchar(parts)]
+}
+
+virus_type_token_class <- function(t) {
+  t <- str_trim(t)
+  if (!nzchar(t) || is.na(t)) {
+    return(NA_integer_)
+  }
+  if (t == "NPEV") {
+    return(1L)
+  }
+  if (grepl("WILD", t, fixed = TRUE)) {
+    return(4L)
+  }
+  if (grepl("VACCINE", t, fixed = TRUE)) {
+    return(2L)
+  }
+  if (grepl("cVDPV", t, fixed = TRUE) || grepl("aVDPV", t, fixed = TRUE) ||
+      grepl("VDPV", t, fixed = TRUE)) {
+    return(3L)
+  }
+  5L
+}
+
+add_virus_type_order_indicators <- function(d) {
+  if (!"virus_type_s" %in% names(d)) {
+    return(d)
+  }
+  tok_lists <- lapply(seq_len(nrow(d)), function(i) parse_virus_type_tokens(d$virus_type_s[i]))
+  cls_mat <- matrix(FALSE, nrow = nrow(d), ncol = 5L)
+  for (i in seq_along(tok_lists)) {
+    toks <- tok_lists[[i]]
+    if (!length(toks)) {
+      next
+    }
+    for (t in toks) {
+      k <- virus_type_token_class(t)
+      if (!is.na(k) && k >= 1L && k <= 5L) {
+        cls_mat[i, k] <- TRUE
+      }
+    }
+  }
+  d$virus_type_ord_1 <- cls_mat[, 1L]
+  d$virus_type_ord_2 <- cls_mat[, 2L]
+  d$virus_type_ord_3 <- cls_mat[, 3L]
+  d$virus_type_ord_4 <- cls_mat[, 4L]
+  d$virus_type_ord_5 <- cls_mat[, 5L]
+  d$virus_type_n_unique <- vapply(tok_lists, function(toks) length(unique(toks)), integer(1))
+  d
+}
+
+# ---------------------------------------------------------------------------- #
 # District shapefiles
 
 log_print("Reading district shapefiles")
 
-source("../polio-spec-models/R/utils/IDM/polis_shapes_query_sf.R")
-filename_shapes = paste0("/Users/phpuenig/Dropbox/Polio-SPEC/Analysis/Data/",
-                         "WHO_POLIO_GLOBAL_GEODATABASE.gdb")
-
-shape2 <- st_read_geodb(filename_shapes,2) %>% 
-  st_make_valid() |> 
-  filter(enddate > "2024-01-01", iso_3_code == iso_code) 
-shape1 <- read_sf_geodb(filename_shapes,1) |> 
-  filter(enddate > "2024-01-01", iso_3_code == iso_code)
-shape0 <- read_sf_geodb(filename_shapes,0) |> 
-  filter(enddate > "2024-01-01", iso_3_code == iso_code)
+shape2 <- readRDS(here(outdir,"shape2.rds"))
 
 #---------------------------------------------------------------------------- #
 # NPAFP rate (for population denominator)
 
 log_print("Reading NPAFP data")
 
-periods = date_to_period(seq(ymd("2020-01-01"),ymd("2024-12-01"), by = "month"))
+periods = date_to_period(seq(tp[1],tp[2], by = "month"))
 
 npafp_raw <- readxl::read_xlsx(file.path(datadir, 
                                        list.files(datadir,pattern = "Indicators"))) |> 
@@ -70,22 +132,22 @@ npafp_raw <- readxl::read_xlsx(file.path(datadir,
          period = date_to_period(dmy(paste0("1",period))))
 
 row_fill <- npafp_raw |>
-  expand(guid = unique(shape2$guid), period = periods) 
+  expand(guid = unique(shape2$guid_old), period = periods) 
   
 # Expand time points for each guid
 npafp <- npafp_raw |>
   right_join(row_fill) |>
   mutate(month = ymd(paste0(period_to_date(period), "-01")),
          year = floor(period),
+         polis_npafp_rate = value,
          missing_denom = is.na(denominator)) |> 
-  select(guid, period, month, year, numerator, denominator, missing_denom) 
+  select(guid, period, month, year, polis_npafp_rate, numerator, denominator, missing_denom) 
 
 names(npafp)
 summary(npafp)
 
 tabyl(npafp, missing_denom, year)
 tabyl(npafp, year)
-# All missing for 2021?
 
 log_print(paste0("Imputing ",
                  sum (npafp$missing_denom)," (",round(mean(npafp$missing_denom),2)*100,
@@ -106,51 +168,43 @@ npafp <- npafp |>
 
 log_print("Reading AFP data")
 
-afp_cols <- names(readxl::read_excel(file.path(datadir, 
-                                              list.files(datadir,pattern = "Human")), n_max = 0))
-afp_types <- rep("text",length(afp_cols))
-afp_types[grepl("Date",afp_cols)] <- "date"
-afp_types[grepl("Age",afp_cols) | grepl("Number",afp_cols)] <- "numeric"
-afp_types[which(afp_cols %in% c("X","Y"))] <- "numeric"
-afp_types[grepl("PoNS",afp_cols) | grepl("Exact",afp_cols) | grepl("Paralysis",afp_cols)| grepl("Contact",afp_cols)] <- "skip"
+# Prefer AFP case file over Specimen file when both exist
+human_files <- list.files(datadir, pattern = "Human")
+afp_file <- human_files[grepl("AFP_Only", human_files) |
+                         (grepl("Detailed", human_files) & !grepl("Specimen", human_files))]
+if (length(afp_file) == 0) afp_file <- human_files[1]
 
-afp_raw <- readxl::read_xlsx(file.path(datadir, 
-                                       list.files(datadir, pattern = "Human")),
-                             col_types = afp_types) %>%
+afp_cols <- names(readxl::read_excel(file.path(datadir, afp_file), n_max = 0))
+afp_types <- rep("text", length(afp_cols))
+afp_types[grepl("Date", afp_cols)] <- "date"
+afp_types[grepl("Age", afp_cols) | grepl("Number", afp_cols)] <- "numeric"
+afp_types[which(afp_cols %in% c("X", "Y"))] <- "numeric"
+afp_types[grepl("PoNS", afp_cols) | grepl("Exact", afp_cols) | grepl("Paralysis", afp_cols) | grepl("Contact", afp_cols)] <- "skip"
+
+afp_raw <- readxl::read_xlsx(file.path(datadir, afp_file), col_types = afp_types) %>%
   clean_names()
 
 names(afp_raw)
 summary(afp_raw)
 
-tabyl(afp_raw$classification, exclude = NULL)
-
 log_print("Set up AFP variables and drop 'Not an AFP' cases")
 
-afp_raw %>% 
+afp_raw %>%
   rename(iso_3_code = country_iso3,
-         # Case date is defined as date of paralysis onset - take this as general date for FFI analysis
          date = case_date,
          onset_date = date_onset,
-         report_wk = afp_reporting_week) %>% 
-  mutate(guid = paste0("{",toupper(admin_2_guid),"}"),
+         report_wk = afp_reporting_week) %>%
+  mutate(guid = paste0("{", toupper(admin_2_guid), "}"),
          period = date_to_period(date),
          month = floor_date(date, "month"),
          year = year(date),
-         final_class = case_when(grepl("WILD1",virus_type_s) ~ "WPV1",
-                           grepl("WILD3",virus_type_s) ~ "WPV3",
-                           grepl("cVDPV2", virus_type_s) ~ "cVDPV2",
-                           grepl("aVDPV2", virus_type_s) ~ "aVDPV2",
-                           grepl("VDPV", virus_type_s) ~ "VDPV",
-                           grepl("NPEV", virus_type_s) ~ "NPEV"),
-         # Calculated age has the least missingness out of all age vars
-         age_m = calculated_age_months) %>% 
-  select(epid, place_admin_1, place_admin_2, guid:year, date,
+         age_m = calculated_age_months) %>%
+  select(epid, place_admin_1, place_admin_2, guid, period, month, year, date,
          onset_date, notification_date, investigation_date, stool_date_sent_to_lab, report_wk,
-         age_m,
-         final_class, classification,
+         age_m, classification,
          vaccine_1:npev, stool_adequacy,
-         virus_type_s, virus_cluster_s, virus_is_orphan,emergence_group_s,
-         iso_3_code,x,y) %>% 
+         virus_type_s, virus_cluster_s, virus_is_orphan, emergence_group_s,
+         iso_3_code, x, y) %>%
   filter(classification != "Not an AFP") -> afp
 
 log_print("Checking ages")
@@ -252,24 +306,23 @@ es_raw <- readxl::read_xlsx(file.path(datadir,
   clean_names()
 
 log_print("Set up ES variables")
-es_raw %>% 
+# Nigeria ES has both env_sample_id and sample_id; Pakistan has env_sample_id only
+es_raw <- es_raw %>%
   rename(iso_3_code = country_iso3,
-         sample_id = env_sample_id,
          x = y,
-         y = x) %>% 
+         y = x)
+if ("sample_id" %in% names(es_raw) && "env_sample_id" %in% names(es_raw)) {
+  es_raw <- select(es_raw, -env_sample_id)  # keep sample_id, drop duplicate
+} else if ("env_sample_id" %in% names(es_raw)) {
+  es_raw <- rename(es_raw, sample_id = env_sample_id)
+}
+es_raw <- es_raw %>%
   separate(environmental_site, into = c("site_id","site_name"), sep = " -") %>% 
   mutate(guid = paste0("{",toupper(admin_2_guid),"}"),
          # across(c(collection_date, date_received_in_lab),
          #        lubridate::dmy),
          month = floor_date(ymd(collection_date), "month"),
          year = year(collection_date),
-         final_class = case_when(grepl("WILD1",virus_type_s) ~ "WPV1",
-                           grepl("WILD3",virus_type_s) ~ "WPV3",
-                           grepl("cVDPV2", virus_type_s) ~ "cVDPV2",
-                           grepl("aVDPV2", virus_type_s) ~ "aVDPV2",
-                           grepl("VDPV", virus_type_s) ~ "VDPV",
-                           grepl("VACCINE", virus_type_s) ~ "Vaccine",
-                           grepl("NPEV", virus_type_s) ~ "NPEV"),
          travel_time = difftime(date_received_in_lab, collection_date, "days"),
         across(site_id:site_name, trimws))  -> es
 
@@ -297,15 +350,15 @@ es %>%
 # ---------------------------------------------------------------------------- #
 # Save cleaned datasets
 
-log_print(paste("Saving cleaned datasets in", here(outdir, country)))
+log_print("Derive virus_type_ord_1..5 and virus_type_n_unique from virus_type_s")
+afp <- add_virus_type_order_indicators(afp)
+es <- add_virus_type_order_indicators(es)
 
-saveRDS(shape2, here(outdir, country, "shape2.rds"))
-saveRDS(shape1, here(outdir, country, "shape1.rds"))
-saveRDS(shape0, here(outdir, country, "shape0.rds"))
+log_print(paste("Saving cleaned datasets in", outdir))
 
-write_csv(afp, here(outdir, country, "linelist_afp_clean.csv"))
-write_csv(es, here(outdir, country, "linelist_es_clean.csv")) 
-write_csv(npafp, here(outdir, country, "npafp_clean.csv"))
+write_csv(afp, here(outdir, "linelist_afp_clean.csv"))
+write_csv(es, here(outdir, "linelist_es_clean.csv")) 
+write_csv(npafp, here(outdir, "npafp_clean.csv"))
 
 ################################################################################
 ################################################################################

@@ -1,44 +1,108 @@
 ################################################################################
-# Run full analysis workflow for configured country and time period
+# Run analysis workflow - setup, prevalence, and/or detection
 #
-# 1. Edit R/config.R: set country and tp
-# 2. Ensure raw POLIS data in Dropbox: .../polis/csv/<country>/
-# 3. For new countries: add WorldPop rasters to data/<country>/WorldPop/
-# 4. For watersheds: run R/setup/setup_watersheds.Rmd (requires Novel-T data)
-# 5. Source and run this script
+# Usage:
+#   source("run_analysis.R")                    # run all components
+#   source("run_analysis.R", local = new.env()) # with run_* = TRUE/FALSE set below
+#
+#   Rscript run_analysis.R                      # run all
+#   Rscript run_analysis.R setup                # setup only
+#   Rscript run_analysis.R prevalence           # prevalence only
+#   Rscript run_analysis.R detection            # detection only
+#   Rscript run_analysis.R setup prevalence     # setup + prevalence
+#
+# Prerequisites: Edit R/config.R (country, tp), raw POLIS data, WorldPop rasters
 ################################################################################
+
+# Parse command-line args (when run via Rscript)
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) == 0) {
+  run_setup      <- TRUE
+  run_prevalence <- TRUE
+  run_detection  <- TRUE
+} else {
+  run_setup      <- "setup"     %in% args
+  run_prevalence <- "prevalence" %in% args
+  run_detection  <- "detection" %in% args
+}
+
+# Alternatively, set these directly when sourcing interactively:
+# run_setup <- TRUE
+# run_prevalence <- FALSE
+# run_detection <- TRUE
 
 library(here)
 source(here("R/config.R"))
 
-message("Running analysis for ", country, " (", tp[1], " to ", tp[2], ")")
+message("========================================")
+message("NPEV analysis workflow: ", country)
+message("Time period: ", tp[1], " to ", tp[2])
+message("Components: ", 
+        if (run_setup) "setup " else "",
+        if (run_prevalence) "prevalence " else "",
+        if (run_detection) "detection" else "")
+message("========================================\n")
 
-# Step 1: Clean raw POLIS data
-message("\n--- Step 1: Cleaning POLIS data ---")
-source(here("R/setup/clean_polis.R"))
+################################################################################
+# 1. SETUP
+# -----------------------------------------------------------------------------
 
-# Step 2: Set up analysis data (clears env; config is re-sourced inside)
-message("\n--- Step 2: Analysis data setup ---")
-source(here("R/setup/analysis_data_setup.R"))
+if (run_setup) {
+  message("--- Step 1: Setup ---")
+  message("  Cleaning POLIS data")
+  source(here("R/setup/clean_polis.R"))
 
-# Re-load config (analysis_data_setup clears environment)
-source(here("R/config.R"))
+  message("  Analysis data setup")
+  source(here("R/setup/analysis_data_setup.R"))
 
-# Step 3: Prevalence model setup
-message("\n--- Step 3: Prevalence model setup ---")
-source(here("R/prevalence/prev_model_setup.R"))
+  source(here("R/config.R"))  # re-load (analysis_data_setup clears env)
+  # Re-set component flags (analysis_data_setup clears workspace)
+  args <- commandArgs(trailingOnly = TRUE)
+  if (length(args) == 0) {
+    run_setup <- TRUE; run_prevalence <- TRUE; run_detection <- TRUE
+  } else {
+    run_setup <- "setup" %in% args
+    run_prevalence <- "prevalence" %in% args
+    run_detection <- "detection" %in% args
+  }
+}
 
-# Step 4: Fit prevalence model
-message("\n--- Step 4: Fitting prevalence model ---")
-source(here("R/prevalence/prev_model_fit.R"))
+################################################################################
+# 2. PREVALENCE
+# -----------------------------------------------------------------------------
 
-# Step 5: Extract prevalence predictions
-message("\n--- Step 5: Prevalence predictions ---")
-source(here("R/prevalence/prev_model_predict.R"))
+if (run_prevalence) {
+  message("\n--- Step 2: Prevalence ---")
+  if (!run_setup) source(here("R/config.R"))
 
-# Step 6: ES detection model - requires es_npev_xy from es_data_setup.Rmd
-message("\n--- Step 6: ES detection model ---")
-message("Run R/detection/es_data_setup.Rmd to create es_npev_xy.rds, then:")
-source(here("R/detection/es_model_fit.R"))
+  message("  Model setup")
+  source(here("R/prevalence/prev_model_setup.R"))
 
-message("\nDone. Outputs in output/prevalence/", country, " and output/detection/", country)
+  message("  Fitting model")
+  source(here("R/prevalence/prev_model_fit.R"))
+
+  message("  Extracting predictions")
+  source(here("R/prevalence/prev_model_predict.R"))
+}
+
+################################################################################
+# 3. DETECTION
+# -----------------------------------------------------------------------------
+
+if (run_detection) {
+  message("\n--- Step 3: Detection ---")
+  if (!run_setup && !run_prevalence) source(here("R/config.R"))
+
+  message("  ES data setup (link samples to district prevalence, creates es_ev_xy.rds)")
+  source(here("R/setup/es_data_setup.R"))
+
+  message("  Fitting ES detection model")
+  source(here("R/detection/es_model_fit.R"))
+}
+
+################################################################################
+
+message("\n========================================")
+message("Done.")
+message("Outputs: output/prevalence/", country, ", output/detection/", country)
+message("========================================")

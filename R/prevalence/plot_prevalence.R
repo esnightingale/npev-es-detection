@@ -14,8 +14,8 @@ figdir <- "figures/prevalence/prediction"
 
 shape2 <- read_rds(here(dir,"../shape2.rds"))
 
-pred <- read_rds(here(outdir,"pred_prev_npev.rds"))
-pred_draws <- read_rds(here(outdir,"draws_prev_npev.rds"))
+pred <- read_rds(here(outdir,"pred_prev_ev.rds"))
+pred_draws <- read_rds(here(outdir,"draws_prev_ev.rds"))
 
 # Set colour palette for provinces
 pal_prov <- viridis::turbo(n_distinct(shape2$adm1_name))  
@@ -24,14 +24,14 @@ names(pal_prov) <- unique(shape2$adm1_name)
 # Observed vs predicted ---------------------------------------------------
 
 pred |> 
-  arrange(n_npafp) |> 
-  ggplot(aes(n_npev, col = n_npafp, size = n_npafp,
+  arrange(n_afp) |> 
+  ggplot(aes(n_ev, col = n_afp, size = n_afp,
              y = pred_y, ymin = low_y, ymax = hi_y)) + 
   geom_abline() +
   geom_jitter(alpha = 0.7) +  
   guides(size = "none") +
   scale_colour_viridis_b(option = "mako", direction= -1) +
-  labs(x = "Observed NPEV positives (per district/month)",
+  labs(x = "Observed EV positives (per district/month)",
        y = "Posterior prediction",
        col = "No. tested") + 
   theme(legend.position = c(0.85,0.2), legend.background = element_rect(fill = "white"))
@@ -39,16 +39,15 @@ ggsave(here(figdir,"pred_y_scatter.png"),
        height = 6, width = 8, bg = "white")
 
 pred |> 
-  filter(n_npafp > 5) |> 
-  arrange(n_npafp) |> 
-  ggplot(aes(npev_npafp_p, size = n_npafp, col = n_npafp, 
+  filter(n_afp > 5) |> 
+  arrange(n_afp) |> 
+  ggplot(aes(ev_afp_p, size = n_afp, col = n_afp, 
              y = pred_p, ymin = low_p, ymax = hi_p)) + 
   geom_abline() +
   geom_point(alpha = 0.7) + 
   guides(size = "none") +
   scale_colour_viridis_b(option = "mako", direction= -1) +
-  # scale_alpha_continuous(range = c(0.01,1)) + #c(0.01,0.1,0.5,0.75,1)
-  labs(x = "Observed NPEV prevalence (per district/month)",
+  labs(x = "Observed EV prevalence (per district/month)",
        y = "Posterior prediction",
        col = "No. tested") + 
   theme(legend.position = c(0.85,0.2), legend.background = element_rect(fill = "white"))
@@ -56,23 +55,23 @@ ggsave(here(figdir,"pred_prev_scatter.png"),
        height = 6, width = 8, bg = "white")
 
 pred |> 
-  filter(n_npafp >=10) |> 
-  arrange(n_npafp) |> 
-  ggplot(aes(npev_npafp_p, size = n_npafp, col = n_npafp, 
+  filter(n_afp >= 10) |> 
+  arrange(n_afp) |> 
+  ggplot(aes(ev_afp_p, size = n_afp, col = n_afp, 
              y = pred_p, ymin = low_p, ymax = hi_p)) + 
   geom_abline() +
   geom_jitter(alpha = 0.7) + 
   guides(size = "none") +
   scale_colour_viridis_b(option = "mako", direction= -1) +
-  labs(x = "Observed NPEV prevalence (per district/month)",
+  labs(x = "Observed EV prevalence (per district/month)",
        y = "Posterior prediction",
        col = "No. tested",
-       caption = "Data subset to district:months with at least 10 NP-AFP notifications") + 
+       caption = "Data subset to district:months with at least 10 AFP notifications") + 
   theme(legend.position = c(0.85,0.2), legend.background = element_rect(fill = "white"))
 ggsave(here(figdir,"pred_prev_scatter_gt10.png"),
        height = 6, width = 8, bg = "white")
 
-# Many month:district with a single NPAFP notification. 
+# Many month:district with a single AFP notification. 
 # - These still add some information due to pooling
 
 
@@ -80,7 +79,7 @@ ggsave(here(figdir,"pred_prev_scatter_gt10.png"),
 
 pred |> 
   ggplot(aes(month, group = guid)) + 
-  geom_jitter(aes(y = npev_npafp_p), 
+  geom_jitter(aes(y = ev_afp_p), 
               col = "grey", alpha = 0.5, cex = 0.2) +
   geom_ribbon(aes(ymin = low_p, ymax = hi_p), 
               alpha = 0.2, fill = "lightsteelblue") + 
@@ -90,12 +89,11 @@ pred |>
 
 pred |> 
   ggplot(aes(month, group = guid)) + 
-  geom_jitter(aes(y = npev_npafp_p), 
+  geom_jitter(aes(y = ev_afp_p), 
               col = "grey", alpha = 0.5, cex = 0.2) +
   geom_ribbon(aes(ymin = pred_p - 1.96*sd_p, ymax = pred_p + 1.96*sd_p), 
               alpha = 0.2, fill = "lightsteelblue") + 
   geom_line(aes(y = pred_p), alpha = 0.2, col = "steelblue4") + 
-  # geom_line(aes(y = pred_mean), col = "red", alpha = 0.1) +
   labs(y = "Estimated prevalence", x = "Month", title= "Predicted mean & 95% gaussian interval")
 
 
@@ -105,7 +103,7 @@ pred |>
   ggplot(aes(month, pred_p, col = guid, fill = guid)) +
   geom_ribbon(aes(ymin = low_p, ymax = hi_p), alpha = 0.2, col = NA) +
   geom_line(lwd = 0.2) + 
-  geom_line(aes(y = npev_npafp_p), lty = "dashed") +
+  geom_line(aes(y = ev_afp_p), lty = "dashed") +
   scale_colour_viridis_d(option = "turbo") +
   scale_fill_viridis_d(option = "turbo") +
   facet_wrap(~guid) +
@@ -125,7 +123,7 @@ dev.off()
 ## Monthly total
 summdata <- pred |> 
   group_by(month) |> 
-  summarise(p_obs = sum(n_npev)/sum(n_npafp)) |> ungroup()
+  summarise(p_obs = sum(n_ev)/sum(n_afp)) |> ungroup()
 
 pred_draws |> 
   group_by(month) |>
@@ -152,7 +150,7 @@ ggsave(here(figdir,"pred_mth_tot.png"),
 
 summdata_prov <- pred |> 
   group_by(month, adm1_name) |> 
-  summarise(p_obs = sum(n_npev)/sum(n_npafp)) |> ungroup()
+  summarise(p_obs = sum(n_ev)/sum(n_afp)) |> ungroup()
 
 pred_draws |> 
   group_by(month, adm1_name) |>
